@@ -1,0 +1,202 @@
+.dashboard-root {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 62% 38%;
+  background: #05070c;
+  font-family: 'SF Mono', 'JetBrains Mono', monospace;
+  color: #e6edf7;
+}
+
+/* ---------------- Hero: flygym camera feed ---------------- */
+
+.hero-fly {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  border-right: 1px solid rgba(120, 160, 255, 0.15);
+}
+
+.hero-fly-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  image-rendering: pixelated;
+}
+
+.video-placeholder.large {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #556;
+  font-size: 14px;
+}
+
+.hero-overlay {
+  position: absolute;
+  z-index: 10;
+}
+.hero-overlay.top-left { top: 16px; left: 16px; }
+.hero-overlay.top-right { top: 16px; right: 16px; min-width: 170px; }
+.hero-overlay.bottom-left { bottom: 16px; left: 16px; }
+
+/* ---------------- Right column: brain + controls ---------------- */
+
+.side-col {
+  display: grid;
+  grid-template-rows: 55% 45%;
+  min-height: 0;
+}
+
+.brain-view {
+  position: relative;
+  background: #05070c;
+  border-bottom: 1px solid rgba(120, 160, 255, 0.15);
+  min-height: 0;
+}
+
+.brain-view canvas {
+  display: block;
+}
+
+/* ---------------- Shared panel chrome ---------------- */
+
+.hud {
+  position: absolute;
+  z-index: 10;
+  pointer-events: none;
+}
+.hud.top-left { top: 12px; left: 12px; }
+
+.panel {
+  background: rgba(10, 14, 22, 0.78);
+  border: 1px solid rgba(120, 160, 255, 0.18);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  backdrop-filter: blur(6px);
+}
+
+.panel.small {
+  padding: 8px 10px;
+  font-size: 11px;
+}
+
+.panel.error {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ff8888;
+  font-size: 14px;
+}
+
+.title {
+  font-weight: 600;
+  color: #9fc4ff;
+  margin-bottom: 6px;
+  letter-spacing: 0.02em;
+}
+
+.minimap {
+  border-radius: 6px;
+  border: 1px solid rgba(120, 160, 255, 0.18);
+  display: block;
+}
+
+.drive-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.drive-bar-track {
+  width: 90px;
+  height: 8px;
+  background: rgba(120, 160, 255, 0.12);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.drive-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4fa3ff, #ff6644);
+  transition: width 0.05s linear;
+}
+
+/* ---------------- Control panel ---------------- */
+
+.control-panel {
+  position: relative;
+  border-radius: 0;
+  border: none;
+  border-top: none;
+  overflow-y: auto;
+  padding: 16px 18px;
+  font-size: 13px;
+}
+
+.control-row {
+  margin-bottom: 10px;
+}
+.control-row.buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  flex: 1;
+  background: rgba(79, 163, 255, 0.12);
+  border: 1px solid rgba(120, 160, 255, 0.3);
+  color: #e6edf7;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.btn:hover { background: rgba(79, 163, 255, 0.25); }
+.btn:active { background: rgba(79, 163, 255, 0.4); }
+.btn:disabled { cursor: default; opacity: 0.9; }
+
+.btn.primary {
+  background: rgba(255, 102, 68, 0.18);
+  border-color: rgba(255, 102, 68, 0.4);
+}
+.btn.primary:hover { background: rgba(255, 102, 68, 0.32); }
+
+.btn.dn-left, .btn.dn-right {
+  background: rgba(255, 102, 68, 0.1);
+  border-color: rgba(255, 102, 68, 0.3);
+}
+.btn.dn-left:hover, .btn.dn-right:hover { background: rgba(255, 102, 68, 0.25); }
+
+.btn.ok { color: #63d68f; border-color: rgba(99, 214, 143, 0.4); }
+.btn.bad { color: #ff8080; border-color: rgba(255, 128, 128, 0.4); }
+
+.slider-label {
+  display: block;
+  margin-bottom: 12px;
+  color: #b9c6dd;
+  font-size: 12px;
+}
+.slider-label input[type='range'] {
+  width: 100%;
+  margin-top: 4px;
+  accent-color: #4fa3ff;
+}
+
+/* ---------------- Small screens: stack instead of split ---------------- */
+
+@media (max-width: 900px) {
+  .dashboard-root {
+    grid-template-columns: 1fr;
+    grid-template-rows: 55% 45%;
+  }
+  .hero-fly { border-right: none; border-bottom: 1px solid rgba(120, 160, 255, 0.15); }
+}

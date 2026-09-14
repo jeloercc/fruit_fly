@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/checkpoints/
+data/*.json
+data/*.mp4
+data/*.log
+
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env
