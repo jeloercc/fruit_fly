@@ -118,13 +118,22 @@ def soma_xyz(soma_location) -> tuple[float | None, float | None, float | None]:
 # --------------------------------------------------------------------------
 
 def fetch_nodes(client, checkpoint_dir: Path, superclasses: list[str],
-                 max_retries: int, include_unclassified: bool) -> pd.DataFrame:
+                 max_retries: int, include_unclassified: bool,
+                 classes: list[str] | None = None) -> pd.DataFrame:
     from neuprint import fetch_custom
 
     nodes_dir = checkpoint_dir / "nodes"
     nodes_dir.mkdir(parents=True, exist_ok=True)
 
     batches = [(sc, f"n.superclass = '{sc}'") for sc in superclasses]
+    # `class` is a finer-grained field than `superclass` for some real
+    # populations — e.g. Kenyon cells and MBONs both share the huge
+    # (32k-neuron) `cb_intrinsic` superclass, so scoping by superclass alone
+    # would pull far more than intended. `--only-classes` scopes by the
+    # `class` property instead, checkpointed the same way (prefixed
+    # `class_` so it can't collide with a superclass name).
+    for cls in (classes or []):
+        batches.append((f"class_{cls}", f"n.class = '{cls}'"))
     if include_unclassified:
         # Only pull unlabeled bodies when doing a full-dataset export —
         # a scoped/pilot run (--only-superclasses) should stay scoped.
@@ -273,6 +282,10 @@ def main():
     ap.add_argument("--max-retries", type=int, default=5)
     ap.add_argument("--only-superclasses", default=None,
                      help="comma-separated subset of superclasses, for bounded/pilot runs")
+    ap.add_argument("--only-classes", default=None,
+                     help="comma-separated subset of the finer-grained `class` property "
+                          "(e.g. Kenyon_Cell,MBON,DAN) — for populations too small to "
+                          "isolate by --only-superclasses alone")
     ap.add_argument("--skip-edges", action="store_true")
     args = ap.parse_args()
 
@@ -281,13 +294,15 @@ def main():
     log.info("Connected to %s dataset=%s", args.server, env["dataset"])
 
     checkpoint_dir = Path(args.checkpoint_dir)
-    scoped_run = args.only_superclasses is not None
+    scoped_run = args.only_superclasses is not None or args.only_classes is not None
     superclasses = (
-        args.only_superclasses.split(",") if scoped_run else KNOWN_SUPERCLASSES
+        args.only_superclasses.split(",") if args.only_superclasses is not None else
+        (KNOWN_SUPERCLASSES if args.only_classes is None else [])
     )
+    classes = args.only_classes.split(",") if args.only_classes else None
 
     nodes = fetch_nodes(client, checkpoint_dir, superclasses, args.max_retries,
-                         include_unclassified=not scoped_run)
+                         include_unclassified=not scoped_run, classes=classes)
     log.info("Total nodes: %d (DNs: %d)", len(nodes),
               (nodes["superclass"].isin(DN_SUPERCLASSES)).sum())
 
