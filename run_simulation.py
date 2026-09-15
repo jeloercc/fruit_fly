@@ -609,19 +609,22 @@ class BrainLIF:
     def flight_command(
         self, base_thrust: float = 0.5, speed_gain: float = 1.2, yaw_gain: float = 4.0,
         thrust_range: tuple[float, float] = (0.0, 1.0), yaw_range: tuple[float, float] = (-2.0, 2.0),
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float, float]:
         """Translate DN spike-rate readout directly into a (thrust, yaw_rate)
         flight command — no training involved. Same L/R-DN-rate readout as
         the walking-controller version this replaced, just interpreted as
         flight kinematics instead of a CPG drive: overall DN activity ->
-        forward thrust, left/right DN imbalance -> yaw."""
+        forward thrust, left/right DN imbalance -> yaw. Also returns the raw
+        per-side rates (unclipped, un-gained) so callers can broadcast the
+        actual DN readout the motor hook is built on, not just the derived
+        thrust/yaw it collapses down to."""
         overall = self.dn_rate[self.is_dn].mean() if self.is_dn.any() else 0.0
         left_rate = self.dn_rate[self.dn_left].mean() if self.dn_left.any() else overall
         right_rate = self.dn_rate[self.dn_right].mean() if self.dn_right.any() else overall
 
         thrust = np.clip(base_thrust + speed_gain * overall, *thrust_range)
         yaw = np.clip(yaw_gain * (left_rate - right_rate), *yaw_range)
-        return float(thrust), float(yaw)
+        return float(thrust), float(yaw), float(left_rate), float(right_rate)
 
     def spiking_body_ids(self) -> list[int]:
         return self.body_ids[self.spikes].tolist()
@@ -669,6 +672,8 @@ class BrainSnapshot:
     reward_signal: float = 0.0
     cumulative_reward: float = 0.0
     learning_enabled: bool = False
+    dn_left_rate: float = 0.0
+    dn_right_rate: float = 0.0
 
 
 class VisionFlightBridge:
@@ -696,7 +701,7 @@ class VisionFlightBridge:
 
     def step(self) -> BrainSnapshot:
         self.brain.step()
-        thrust, yaw = self.brain.flight_command()
+        thrust, yaw, dn_left_rate, dn_right_rate = self.brain.flight_command()
         self._t += self.brain_dt
         return BrainSnapshot(
             t=self._t, thrust=thrust, yaw_rate=yaw,
@@ -704,6 +709,7 @@ class VisionFlightBridge:
             reward_signal=self.brain.dopamine_rate,
             cumulative_reward=self.brain.cumulative_reward,
             learning_enabled=self.brain.learning_enabled,
+            dn_left_rate=dn_left_rate, dn_right_rate=dn_right_rate,
         )
 
 

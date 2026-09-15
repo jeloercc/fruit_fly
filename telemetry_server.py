@@ -139,6 +139,8 @@ class SimWorker:
                 "t": snap.t,
                 "thrust": snap.thrust,
                 "yaw_rate": snap.yaw_rate,
+                "dn_left_rate": snap.dn_left_rate,
+                "dn_right_rate": snap.dn_right_rate,
                 "spiking_ids": snap.spiking_ids,
                 "paused": False,
                 "sensory_drive": bridge.brain.sensory_drive,
