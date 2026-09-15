@@ -8,11 +8,11 @@
   color: #e6edf7;
 }
 
-/* ---------------- Hero: flygym camera feed ---------------- */
+/* ---------------- Hero: fly body state (Neural Sandbox void) ---------------- */
 
 .hero-fly {
   position: relative;
-  background: #000;
+  background: #05070c;
   overflow: hidden;
   border-right: 1px solid rgba(120, 160, 255, 0.15);
 }

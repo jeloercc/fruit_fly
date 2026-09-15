@@ -181,6 +181,16 @@ class BrainLIF:
         self.dopamine_rate = 0.0       # signed EMA: PAM(reward) - PPL(punishment)
         self.cumulative_reward = 0.0
 
+        # Stamina/fatigue effect (frontend-driven, see dashboard.jsx
+        # FlightRig): an additive mV offset applied only to DN (motor
+        # output) neurons' spike threshold, not the model's global V_TH.
+        # Real neuromuscular fatigue reduces motor-neuron excitability
+        # without touching sensory/interneuron thresholds — this is that
+        # same scoped effect, applied here rather than as a fake
+        # frontend-only speed cap so a fatigued fly's DNs measurably fire
+        # less, not just get their output clamped downstream.
+        self.motor_threshold_boost = 0.0
+
         with open(graph_path) as f:
             graph = json.load(f)
 
@@ -230,6 +240,34 @@ class BrainLIF:
         self.is_sensory_unsided = self.is_sensory & ~(soma_side == "L") & ~(soma_side == "R")
         self.visual_L = 0.5  # normalized brightness (0..1), set live by set_visual_input()
         self.visual_R = 0.5
+
+        # Neural Sandbox: manually-controllable sensory channels, each a real
+        # neuPrint population (not invented categories) identified by `type`
+        # within the existing sensory superclasses:
+        #   optic_L/R    — ol_sensory (compound-eye photoreceptors), same
+        #                  population set_visual_input already drives, split
+        #                  by soma side, exposed here for manual override too
+        #   antennal     — cb_sensory neurons typed "JO-*": real Johnston's
+        #                  Organ units, the fly's actual antennal
+        #                  mechanoreceptor/near-field-sound organ
+        #   olfactory    — cb_sensory neurons typed "ORN": real Olfactory
+        #                  Receptor Neurons (antennal odor input)
+        #   leg_body     — the whole vnc_sensory superclass: real leg/body
+        #                  touch and proprioceptive afferents entering via
+        #                  the ventral nerve cord
+        # group_drive holds a continuous Poisson-rate multiplier per channel
+        # (0 = off), applied additively in _substep — independent of
+        # sensory_drive/visual_L/R, which remain the camera-driven pathway.
+        is_ol = superclass == "ol_sensory"
+        type_str = np.array([(n.get("type") or "") for n in nodes])
+        self._group_masks = {
+            "optic_L": is_ol & (soma_side == "L"),
+            "optic_R": is_ol & (soma_side == "R"),
+            "antennal": np.char.startswith(type_str, "JO"),
+            "olfactory": type_str == "ORN",
+            "leg_body": superclass == "vnc_sensory",
+        }
+        self.group_drive = {name: 0.0 for name in self._group_masks}
 
         log.info(
             "BrainLIF: %d neurons | sensory=%d | DN=%d (L=%d R=%d unsided=%d) | "
@@ -392,7 +430,15 @@ class BrainLIF:
         # 1) Threshold check + reset, on the state carried in from the
         #    previous sub-step (organic crossings from that sub-step's
         #    integration, or a manually forced V from force_spike()).
-        self.spikes = active & (self.V >= self.V_TH)
+        if self.motor_threshold_boost != 0.0:
+            # Only DNs pay the fatigue cost — sensory/interneuron thresholds
+            # are untouched. np.where allocates a temp array; skipped
+            # entirely (falls through to the plain scalar compare) whenever
+            # stamina is full, which is the common case.
+            eff_th = np.where(self.is_dn, self.V_TH + self.motor_threshold_boost, self.V_TH)
+            self.spikes = active & (self.V >= eff_th)
+        else:
+            self.spikes = active & (self.V >= self.V_TH)
         self.V[self.spikes] = self.V_RST
         self.g[self.spikes] = 0.0
         # Poisson-input (sensory) targets get no refractory period at all,
@@ -453,6 +499,16 @@ class BrainLIF:
                 | (self.is_sensory_unsided & (self.rng.random(self.n) < rate_unsided * dt / 1000.0))
             )
             self.V[fires] += self.W_SYN * self.F_POI
+
+        # Neural Sandbox manual channel drive — independent of the camera
+        # pathway above, additive continuous Poisson current per channel.
+        for name, rate in self.group_drive.items():
+            if rate <= 0.0:
+                continue
+            mask = self._group_masks[name]
+            fires_group = mask & (self.rng.random(self.n) < rate * self.R_POI * dt / 1000.0)
+            self.V[fires_group] += self.W_SYN * self.F_POI
+
         if self.noise_std > 0:
             p_bg = self.noise_std * self.R_POI * dt / 1000.0
             fires_bg = active & (self.rng.random(self.n) < p_bg)
@@ -532,6 +588,23 @@ class BrainLIF:
         optic-lobe sensory neurons' Poisson rate directly (see _substep)."""
         self.visual_L = float(np.clip(left, 0.0, 1.0))
         self.visual_R = float(np.clip(right, 0.0, 1.0))
+
+    def set_group_drive(self, name: str, rate: float):
+        """Neural Sandbox: continuous manual drive on one real sensory
+        channel (see _group_masks), independent of the camera pathway.
+        `rate` is a sensory_drive-style multiplier on R_POI, clamped to a
+        sane range so a UI slider can't push a channel to a pathological
+        firing rate."""
+        if name not in self._group_masks:
+            raise ValueError(f"unknown sensory group {name!r}; have {list(self._group_masks)}")
+        self.group_drive[name] = float(np.clip(rate, 0.0, 5.0))
+
+    def group_body_ids(self, name: str) -> list[int]:
+        """bodyIds for one real sensory channel — for discrete force_spike()
+        injection from the UI, same mechanism the PPL/PAM buttons use."""
+        if name not in self._group_masks:
+            raise ValueError(f"unknown sensory group {name!r}; have {list(self._group_masks)}")
+        return self.body_ids[self._group_masks[name]].tolist()
 
     def flight_command(
         self, base_thrust: float = 0.5, speed_gain: float = 1.2, yaw_gain: float = 4.0,

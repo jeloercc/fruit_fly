@@ -99,6 +99,13 @@ def main():
     # Must match dashboard.jsx's soma-point centering exactly so skeletons
     # and somas overlay correctly in the same scene.
     ap.add_argument("--scale", type=float, default=1 / 4000)
+    ap.add_argument("--centroid", default=None,
+                     help="'x,y,z' to center on instead of this batch's own mean — "
+                          "REQUIRED to align with brain_graph.json's soma cloud and with "
+                          "any other skeleton population processed separately, since each "
+                          "batch's own centroid differs by neuron population (e.g. DNs vs. "
+                          "optic-lobe neurons sit in very different parts of the brain). "
+                          "Pass the mean soma [x,y,z] across brain_graph_nodes.json's nodes.")
     args = ap.parse_args()
 
     print(f"Loading {args.inp} ...")
@@ -109,12 +116,18 @@ def main():
     min_radius = float(df["radius"].quantile(args.min_radius_percentile))
     print(f"min_radius (p{args.min_radius_percentile*100:.0f}): {min_radius:.2f}")
 
-    # Same centroid convention as dashboard.jsx's useBrainLayout: center on
-    # the mean soma position. Skeletons don't carry a separate "soma"
-    # marker in this file, so we center on the overall skeleton centroid,
-    # which is a very close proxy (soma is one node within each tree).
-    cx, cy, cz = float(df["x"].mean()), float(df["y"].mean()), float(df["z"].mean())
-    print(f"centroid: ({cx:.0f}, {cy:.0f}, {cz:.0f})  scale: {args.scale}")
+    if args.centroid:
+        cx, cy, cz = (float(v) for v in args.centroid.split(","))
+        print(f"centroid (explicit, shared): ({cx:.0f}, {cy:.0f}, {cz:.0f})  scale: {args.scale}")
+    else:
+        # Falls back to this batch's own mean when no shared centroid is
+        # given — fine in isolation, but this population's centroid can sit
+        # far from another population's (e.g. DNs vs. optic-lobe neurons),
+        # so anything meant to overlay with brain_graph.json's soma cloud or
+        # with another skeleton batch MUST pass --centroid explicitly.
+        cx, cy, cz = float(df["x"].mean()), float(df["y"].mean()), float(df["z"].mean())
+        print(f"centroid (this batch's own mean — NOT aligned with other batches): "
+              f"({cx:.0f}, {cy:.0f}, {cz:.0f})  scale: {args.scale}")
 
     all_segments = []
     for i, (body_id, g) in enumerate(df.groupby("body_id", sort=False)):

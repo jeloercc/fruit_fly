@@ -1,20 +1,25 @@
-// dashboard.jsx — Vision-first flight navigation dashboard.
+// dashboard.jsx — Pure Neural Sandbox dashboard.
 //
-// Architecture: no flygym/MuJoCo body simulation. The fly's body and the
-// virtual park it flies through are simulated kinematically right here in
-// the browser (position/heading integrated each frame from the
-// connectome's own DN readout). The hero viewport is the fly's-eye camera
-// flying through a procedural park; the real connectome (navis DN
-// skeletons as volumetric tube fibers + soma InstancedMesh) sits beside
-// it. Visual input flows the OTHER direction too: each few frames,
-// brightness sampled from a tiny offscreen render of the fly's-eye view is
-// sent to the backend as the optic-lobe sensory neurons' actual driving
-// input (telemetry_server.py's "visual_input" command) — the real
-// compound-eye pathway, not a constant drive.
+// Architecture: no flygym/MuJoCo body simulation, and (as of this pivot) no
+// virtual park/flight-through-terrain either — the earlier vision-first
+// build rendered a procedural park and sampled a compound-eye camera feed
+// from it to drive the optic-lobe sensory neurons automatically. That's
+// gone: the hero viewport is now a blank void holding just the fly's body
+// (FlyAvatar), whose heading/wing-beat respond to the brain's own DN
+// readout (thrust, yaw_rate) so there's still something to watch move, but
+// nothing is simulated flying through space. The real connectome (navis
+// skeletons as volumetric tube fibers + soma InstancedMesh) sits beside it.
+// The core interaction is now manual: the SensoryPanel lets the user
+// directly inject spikes or continuous Poisson drive into real sensory
+// populations (optic lobes, antennal Johnston's Organ, olfactory ORNs,
+// leg/body mechanoreceptors — see SENSORY_CHANNELS and BrainLIF
+// group_drive in run_simulation.py), and watch that propagate through the
+// LIF model into the brain view's spike flashes and the fly's own
+// thrust/yaw/stamina readout.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { Bounds, OrbitControls, Sky } from '@react-three/drei'
+import { Bounds, OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
@@ -27,6 +32,9 @@ const WS_URL = API_BASE.replace(/^http/, 'ws') + '/ws'
 const GRAPH_URL = API_BASE + '/static/brain_graph_nodes.json'
 
 const DN_COLOR = new THREE.Color('#ff6644')
+// Brain-view canvas is dark (glow-on-black theme, confirmed over the
+// briefly-tried white theme) — every color below is scoped to that canvas
+// only (BrainInstances/TubeFibers/SkeletonFibers).
 const NEURON_COLOR = new THREE.Color('#4fa3ff')
 const SPIKE_COLOR = new THREE.Color('#ffffff')
 // Mushroom-body learning circuit — real neuPrint `class` populations, not
@@ -38,16 +46,22 @@ const DAN_COLOR = new THREE.Color('#ffcc33')   // dopaminergic (PAM/PPL) — the
 const LEARN_COLOR = new THREE.Color('#ff2fd0') // overlay for KC/MBON whose synapses have actually moved
 const COLOR_DECAY = 0.85
 const BRAIN_SCALE = 1 / 4000
-const FLIGHT_SPEED = 7 // world units/sec of forward travel at thrust=1
 
-function mulberry32(seed) {
-  return function () {
-    seed |= 0; seed = (seed + 0x6d2b79f5) | 0
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
+// Stamina/fatigue. Real input, no keyboard: this dashboard has no WASD or
+// any manual flight control — thrust/yaw_rate are the DN readout, sent by
+// the backend every tick (see ws.onmessage below) — the vision-first
+// architecture is that the connectome drives the fly, not the player. So
+// "flying" / "turning sharply" here means the brain's own (thrust,
+// yaw_rate) output, not a keypress.
+const STAMINA_MAX = 100
+const STAMINA_THRUST_DRAIN = 6      // %/sec at thrust=1.0
+const STAMINA_SHARP_TURN_YAW = 0.8  // |yaw_rate| above this counts as a sharp turn (yaw_range is +-2.0, see flight_command())
+const STAMINA_TURN_DRAIN = 10       // extra %/sec while turning sharply
+const STAMINA_RECOVER = 15          // %/sec while resting (thrust ~ 0)
+const STAMINA_REST_THRUST = 0.05
+const STAMINA_LOW = 30              // % — sluggishness effects ramp in below this
+const STAMINA_MIN_THRUST_MULT = 0.35 // effective thrust multiplier at stamina=0
+const STAMINA_MAX_THRESHOLD_BOOST_MV = 6 // added to DN spike threshold at stamina=0 (see BrainLIF.motor_threshold_boost)
 
 // ---------------------------------------------------------------------
 // Connectome layout (soma points) — same convention as before
@@ -102,6 +116,11 @@ function BrainInstances({ layout, spikeQueueRef, plasticWeightRef }) {
     }
     mesh.instanceMatrix.needsUpdate = true
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    // The mesh itself (as opposed to its per-instance matrices set above,
+    // which useFrame never touches for position) never moves/rotates/scales
+    // after this — no reason to recompute its own object matrix every frame.
+    mesh.matrixAutoUpdate = false
+    mesh.updateMatrix()
   }, [positions, baseColors, count])
 
   useFrame(() => {
@@ -178,8 +197,9 @@ const _quat = new THREE.Quaternion()
 const _up = new THREE.Vector3(0, 1, 0)
 const _fiberObj = new THREE.Object3D()
 const FIBER_COLOR = new THREE.Color('#7fb8ff')
+const OPTIC_FIBER_COLOR = new THREE.Color('#8fe0a0') // visual pathway (ol_sensory + visual_projection) — distinct from DN output fibers
 
-function TubeFibers({ positions, radius = 0.015 }) {
+function TubeFibers({ positions, radius = 0.015, color = FIBER_COLOR }) {
   const meshRef = useRef()
   const count = positions ? Math.floor(positions.length / 6) : 0
 
@@ -207,20 +227,25 @@ function TubeFibers({ positions, radius = 0.015 }) {
     }
     mesh.instanceMatrix.needsUpdate = true
     mesh.computeBoundingSphere()
+    mesh.matrixAutoUpdate = false // static fiber mesh — never moves after layout
+    mesh.updateMatrix()
   }, [positions, count, radius])
 
   if (!positions || count === 0) return null
   return (
     <instancedMesh ref={meshRef} args={[null, null, count]} frustumCulled>
       <cylinderGeometry args={[1, 1, 1, 5, 1, false]} />
-      <meshBasicMaterial color={FIBER_COLOR} toneMapped={false} transparent opacity={0.8} blending={THREE.AdditiveBlending} />
+      {/* AdditiveBlending for the glow-on-black look; note it would break
+          (saturate straight to white regardless of color) if this canvas
+          ever goes light-themed again — see history around this line. */}
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={0.8} blending={THREE.AdditiveBlending} />
     </instancedMesh>
   )
 }
 
-function SkeletonFibers() {
-  const finePositions = useSegmentBuffer(API_BASE + '/static/dn_skeleton_segments.bin')
-  const coarsePositions = useSegmentBuffer(API_BASE + '/static/dn_skeleton_segments_coarse.bin')
+function useSkeletonLOD(fineUrl, coarseUrl) {
+  const finePositions = useSegmentBuffer(fineUrl)
+  const coarsePositions = useSegmentBuffer(coarseUrl)
   const { camera } = useThree()
   const [level, setLevel] = useState('coarse')
   const frameRef = useRef(0)
@@ -234,8 +259,30 @@ function SkeletonFibers() {
     if (want !== level) setLevel(want)
   })
 
-  const positions = (level === 'fine' ? finePositions : coarsePositions) || coarsePositions || finePositions
-  return <TubeFibers positions={positions} />
+  return (level === 'fine' ? finePositions : coarsePositions) || coarsePositions || finePositions
+}
+
+function SkeletonFibers() {
+  const dnPositions = useSkeletonLOD(
+    API_BASE + '/static/dn_skeleton_segments.bin',
+    API_BASE + '/static/dn_skeleton_segments_coarse.bin',
+  )
+  // Optic-lobe + visual-projection skeletons (ol_sensory, visual_projection)
+  // — the real fibrous morphology of the visual pathway feeding the brain's
+  // optic-lobe sensory neurons, alongside the DN output fibers above. Files
+  // only exist once fetch_skeletons.py + prepare_skeleton_viz.py have been
+  // run for that scope; useSegmentBuffer degrades to null on a 404, so this
+  // renders nothing extra until they do rather than erroring.
+  const opticPositions = useSkeletonLOD(
+    API_BASE + '/static/optic_skeleton_segments.bin',
+    API_BASE + '/static/optic_skeleton_segments_coarse.bin',
+  )
+  return (
+    <>
+      <TubeFibers positions={dnPositions} color={FIBER_COLOR} />
+      <TubeFibers positions={opticPositions} color={OPTIC_FIBER_COLOR} />
+    </>
+  )
 }
 
 function BrainScene({ layout, spikeQueueRef, plasticWeightRef }) {
@@ -248,174 +295,6 @@ function BrainScene({ layout, spikeQueueRef, plasticWeightRef }) {
         <BrainInstances layout={layout} spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef} />
       </Bounds>
       <OrbitControls enableDamping dampingFactor={0.08} rotateSpeed={0.5} makeDefault />
-    </>
-  )
-}
-
-// ---------------------------------------------------------------------
-// Virtual park (procedural, no external assets)
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// Procedural chunked park — the fix for the "trees disappear" bug
-// (see AGENTS.md "Bug: static tree patch vs. unbounded flight" entry).
-// Root cause, confirmed empirically via the TEMP DIAGNOSTIC panel and
-// manual reset-flight testing (not assumed): Park() used to scatter its
-// ~70 trees once, in a fixed disk of radius 6-76 around world origin
-// (0,0), on a fixed 500x500 ground plane also centered on the origin.
-// Nothing regenerated around the fly's *current* position — after
-// several unpaused minutes the fly was measured ~309 units from origin
-// (TEMP DIAGNOSTIC: flyPos), well outside both the tree disk and the
-// ground plane's extent, and everything reappeared immediately after
-// "reset flight" put the fly back at the origin. Not a rendering bug.
-//
-// Fix: an infinite deterministic field, chunked into fixed-size cells.
-// Each cell's trees are derived from a hash of its own (cellX, cellZ)
-// coordinates, so the same point in the world always has the same trees
-// regardless of how many times that cell mounts/unmounts — no server
-// round-trip, no stored world state, just a pure function of position.
-// ---------------------------------------------------------------------
-
-const CELL_SIZE = 24         // world units per cell; FLIGHT_SPEED=7 -> <1 cell/s at typical thrust
-const VIEW_RADIUS_CELLS = 6  // ~144 units out, comfortably past the fog's far=140
-const TREES_PER_CELL = 4
-
-function cellSeed(cx, cz) {
-  // Small integer hash (murmur-ish finalizer) so adjacent/negative cell
-  // coordinates don't produce visibly-correlated seeds.
-  let h = (cx * 374761393) ^ (cz * 668265263)
-  h = Math.imul(h ^ (h >>> 15), 2246822519)
-  h = Math.imul(h ^ (h >>> 13), 3266489917)
-  h ^= h >>> 16
-  return h >>> 0
-}
-
-function TreeCell({ cx, cz }) {
-  // Each tree also draws a per-instance hue from the same seeded RNG (not
-  // just scale/rotation as before) and a 3-layer stacked canopy instead of
-  // one cone, for a fuller, less obviously-primitive silhouette — still
-  // pure MeshBasicMaterial (no lights added: AGENTS.md documents
-  // MeshStandardMaterial rendering everything black twice already in this
-  // project for want of a matched light rig, and there's no browser tool
-  // available this session to visually confirm a new one), so the "sense
-  // of volume" comes from real per-tree/per-layer color variation instead.
-  const trees = useMemo(() => {
-    const rng = mulberry32(cellSeed(cx, cz))
-    const arr = []
-    for (let i = 0; i < TREES_PER_CELL; i++) {
-      const lx = (rng() - 0.5) * CELL_SIZE
-      const lz = (rng() - 0.5) * CELL_SIZE
-      const s = 1 + rng() * 1.6
-      const canopyHue = 95 + rng() * 40      // 95-135: yellow-green to blue-green
-      const canopyLight = 22 + rng() * 10    // varied darkness per tree
-      const trunkHue = 22 + rng() * 14
-      arr.push([lx, lz, s, canopyHue, canopyLight, trunkHue])
-    }
-    return arr
-  }, [cx, cz])
-
-  const originX = cx * CELL_SIZE, originZ = cz * CELL_SIZE
-  return (
-    <>
-      {trees.map(([lx, lz, s, canopyHue, canopyLight, trunkHue], i) => (
-        <group key={i} position={[originX + lx, 0, originZ + lz]}>
-          <mesh position={[0, s * 0.6, 0]}>
-            <cylinderGeometry args={[0.14 * s, 0.2 * s, s * 1.2, 6]} />
-            <meshBasicMaterial color={`hsl(${trunkHue}, 42%, 26%)`} toneMapped={false} />
-          </mesh>
-          {[0, 1, 2].map((layer) => (
-            <mesh key={layer} position={[0, s * (1.1 + layer * 0.5), 0]}>
-              <coneGeometry args={[(0.95 - layer * 0.22) * s, 1.1 * s, 8]} />
-              {/* each layer a touch lighter going up -- cheap fake ambient occlusion */}
-              <meshBasicMaterial
-                color={`hsl(${canopyHue}, 40%, ${canopyLight + layer * 4}%)`}
-                toneMapped={false}
-              />
-            </mesh>
-          ))}
-        </group>
-      ))}
-    </>
-  )
-}
-
-// Ground: one large plane, re-centered under the fly every frame rather
-// than chunked — much simpler than tiling terrain, and at 1200 units wide
-// it takes several minutes of continuous max-thrust flight in one
-// direction to ever approach an edge, which combined with re-centering
-// means it effectively never runs out for any realistic session length.
-function Ground({ flightStateRef }) {
-  const meshRef = useRef()
-  useFrame(() => {
-    const s = flightStateRef.current
-    if (meshRef.current) meshRef.current.position.set(s.x, 0, s.z)
-  })
-  return (
-    <mesh ref={meshRef} rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={[1200, 1200]} />
-      <meshBasicMaterial color="#4f9142" toneMapped={false} />
-    </mesh>
-  )
-}
-
-function ParkChunks({ flightStateRef, debugRef }) {
-  const [activeCells, setActiveCells] = useState(() => [])
-  const frameRef = useRef(0)
-  const lastKeyRef = useRef('')
-
-  useFrame(() => {
-    frameRef.current++
-    if (frameRef.current % 15 !== 0) return // recompute ~4x/s, not every frame
-    const s = flightStateRef.current
-    const centerCx = Math.round(s.x / CELL_SIZE)
-    const centerCz = Math.round(s.z / CELL_SIZE)
-    const key = `${centerCx},${centerCz}`
-    if (key === lastKeyRef.current) return // fly hasn't crossed a cell boundary; no diff needed
-    lastKeyRef.current = key
-
-    const cells = []
-    for (let dx = -VIEW_RADIUS_CELLS; dx <= VIEW_RADIUS_CELLS; dx++) {
-      for (let dz = -VIEW_RADIUS_CELLS; dz <= VIEW_RADIUS_CELLS; dz++) {
-        cells.push([centerCx + dx, centerCz + dz])
-      }
-    }
-    setActiveCells(cells)
-    if (debugRef) {
-      debugRef.current = {
-        ...debugRef.current,
-        activeCellCount: cells.length,
-        nearbyTreeCount: cells.length * TREES_PER_CELL,
-        centerCell: [centerCx, centerCz],
-      }
-    }
-  })
-
-  return (
-    <>
-      {activeCells.map(([cx, cz]) => <TreeCell key={`${cx},${cz}`} cx={cx} cz={cz} />)}
-    </>
-  )
-}
-
-function Park({ flightStateRef, debugRef }) {
-  return (
-    <>
-      {/* drei's <Sky> is a self-contained atmospheric shader (Preetham sky
-          model) — not lit by scene lights, so it's safe to use without the
-          MeshStandardMaterial light-rig problem documented in AGENTS.md.
-          Replaces the flat background color for real atmospheric depth. */}
-      <Sky sunPosition={[100, 18, 60]} turbidity={3} rayleigh={1.1} mieCoefficient={0.006} />
-      <fog attach="fog" args={['#bcdcef', 25, 140]} />
-      {/* Everything below is still MeshBasicMaterial deliberately, same
-          lesson as the brain view: it's self-illuminated and ignores scene
-          lighting entirely, so nothing in the park can end up
-          invisible/black because of a lighting-rig mismatch — only ever a
-          risk in a StandardMaterial scene, never here. Volume/shading now
-          comes from real per-instance/per-layer color variation (see
-          TreeCell) instead of actual lights, since there's no browser tool
-          available this session to visually confirm a new light rig. */}
-      <Ground flightStateRef={flightStateRef} />
-      <ParkChunks flightStateRef={flightStateRef} debugRef={debugRef} />
     </>
   )
 }
@@ -491,153 +370,143 @@ function FlyAvatar({ flightStateRef }) {
 }
 
 // ---------------------------------------------------------------------
-// Kinematic flight: position/heading integrated each frame from the
-// server's DN-derived (thrust, yaw_rate) command. No physics engine —
-// this is why there's no physics-timestep bottleneck anymore.
+// Pure Neural Sandbox: no park, no world to fly through. The fly sits at
+// the origin; heading still integrates from the brain's own yaw_rate (so
+// it visibly turns to face wherever the DN readout points it) and stamina
+// still drains/recovers from the brain's own thrust/yaw_rate — both real
+// outputs of the LIF model, just no longer translated into world-space
+// travel since there's no world here to travel through.
 // ---------------------------------------------------------------------
 
-// Deterministic tree lookup for collision testing — recomputes a cell's
-// trees on demand via the exact same cellSeed/mulberry32 math TreeCell
-// uses, rather than trying to read TreeCell's mounted React state from
-// outside it. Cheap (a handful of RNG draws per nearby cell per frame).
-function treesInCell(cx, cz) {
-  const rng = mulberry32(cellSeed(cx, cz))
-  const arr = []
-  for (let i = 0; i < TREES_PER_CELL; i++) {
-    const lx = (rng() - 0.5) * CELL_SIZE
-    const lz = (rng() - 0.5) * CELL_SIZE
-    const s = 1 + rng() * 1.6
-    arr.push([cx * CELL_SIZE + lx, cz * CELL_SIZE + lz, s])
-  }
-  return arr
-}
-
-function FlightRig({ flightCmdRef, flightStateRef, trailRef, sendVisual, debugRef, onCollision }) {
-  const { camera, gl, scene } = useThree()
-  const rtRef = useRef()
-  const eyeCamRef = useRef()
-  const lookTarget = useRef(new THREE.Vector3())
+function FlyRig({ flightCmdRef, flightStateRef, staminaRef, sendCmd }) {
   const frameRef = useRef(0)
-  const collisionCooldownRef = useRef(0)
-
-  useEffect(() => {
-    rtRef.current = new THREE.WebGLRenderTarget(16, 8)
-    // Separate, never-displayed first-person camera: this is what the fly
-    // itself "sees" (used only for the compound-eye brightness sample
-    // below). The camera the user actually watches is a third-person
-    // chase cam, set from the main `camera` further down — otherwise a
-    // pure first-person view over open park terrain reads as "an empty
-    // screen with nothing on it", which is exactly what was reported.
-    eyeCamRef.current = new THREE.PerspectiveCamera(100, 2, 0.1, 300)
-    return () => rtRef.current.dispose()
-  }, [])
 
   useFrame((_, delta) => {
     const cmd = flightCmdRef.current
     const s = flightStateRef.current
     const dt = Math.min(delta, 0.05) // guard against huge deltas on tab refocus
     s.heading += cmd.yaw_rate * dt
-    const speed = cmd.thrust * FLIGHT_SPEED
-    s.x += Math.sin(s.heading) * speed * dt
-    s.z += Math.cos(s.heading) * speed * dt
-    s.y = 3 + Math.sin(performance.now() * 0.001 + s.heading) * 0.25 // gentle cosmetic bob
 
-    // Third-person chase camera: behind and above the fly, looking at it —
-    // so there's always a visible fly body moving through visible terrain.
-    const behind = 3.5, up = 1.8
-    camera.position.set(
-      s.x - Math.sin(s.heading) * behind,
-      s.y + up,
-      s.z - Math.cos(s.heading) * behind,
-    )
-    lookTarget.current.set(s.x, s.y, s.z)
-    camera.lookAt(lookTarget.current)
-
-    // Obstacle-avoidance learning task: check the fly's own cell + its 8
-    // neighbors for a real tree collision (same deterministic tree field
-    // FlightRig — and ParkChunks — both derive from cellSeed/mulberry32,
-    // so this can't drift out of sync with what's actually rendered). A
-    // 1.5s cooldown after firing avoids spamming force_spike every frame
-    // while the fly sits inside a tree's collision radius.
-    if (onCollision) {
-      collisionCooldownRef.current = Math.max(0, collisionCooldownRef.current - dt)
-      if (collisionCooldownRef.current <= 0) {
-        const fcx = Math.round(s.x / CELL_SIZE), fcz = Math.round(s.z / CELL_SIZE)
-        outer:
-        for (let dx = -1; dx <= 1; dx++) {
-          for (let dz = -1; dz <= 1; dz++) {
-            for (const [tx, tz, ts] of treesInCell(fcx + dx, fcz + dz)) {
-              const ddx = s.x - tx, ddz = s.z - tz
-              const collideDist = 0.35 * ts + 0.15 // canopy/trunk radius + fly body
-              if (ddx * ddx + ddz * ddz < collideDist * collideDist) {
-                onCollision()
-                collisionCooldownRef.current = 1.5
-                break outer
-              }
-            }
-          }
-        }
-      }
+    // Stamina: drains while the brain's own DN output calls for thrust or a
+    // sharp turn, recovers at rest (thrust ~ 0) — see constants above for
+    // why there's no keyboard input in this term.
+    const isSharpTurn = Math.abs(cmd.yaw_rate) > STAMINA_SHARP_TURN_YAW
+    let stamina = staminaRef.current
+    if (cmd.thrust > STAMINA_REST_THRUST) {
+      stamina -= STAMINA_THRUST_DRAIN * cmd.thrust * dt
+      if (isSharpTurn) stamina -= STAMINA_TURN_DRAIN * dt
+    } else {
+      stamina += STAMINA_RECOVER * dt
     }
+    stamina = Math.max(0, Math.min(STAMINA_MAX, stamina))
+    staminaRef.current = stamina
 
-    // TEMP DIAGNOSTIC (Prompt 1 investigation) — cheap ref mutation, no
-    // re-render; Dashboard polls this on an interval to display it.
-    if (debugRef) {
-      debugRef.current = {
-        ...debugRef.current,
-        camPos: [camera.position.x, camera.position.y, camera.position.z].map((v) => +v.toFixed(2)),
-        flyPos: [s.x, s.y, s.z].map((v) => +v.toFixed(2)),
-        heading: +s.heading.toFixed(3),
-        trailLen: trailRef.current.length,
-      }
-    }
+    // Biological effect, two layers: (1) an artificial client-side cap on
+    // thrust (visible as a slower wing-beat/bob below), and (2) a real
+    // inhibitory signal sent to the LIF model itself — raising DN spike
+    // threshold, so a fatigued fly's descending neurons measurably fire
+    // less, not just get their output clamped downstream of the brain.
+    const staminaFrac = Math.max(0, Math.min(1, stamina / STAMINA_LOW))
+    const thrustMult = stamina < STAMINA_LOW
+      ? STAMINA_MIN_THRUST_MULT + (1 - STAMINA_MIN_THRUST_MULT) * staminaFrac
+      : 1.0
+    s.thrust = cmd.thrust * thrustMult
+    s.y = Math.sin(performance.now() * 0.001 + s.heading) * 0.15 * (0.3 + s.thrust) // cosmetic bob, scales with effective thrust
 
     frameRef.current++
-    if (frameRef.current % 5 === 0) {
-      trailRef.current.push([s.x, s.z])
-      if (trailRef.current.length > 800) trailRef.current.shift()
-    }
-
-    // Compound-eye sampling: render the fly's own first-person view (the
-    // separate eyeCam, not the chase cam the user sees) into a tiny
-    // offscreen target and split it into left/right average brightness —
-    // the actual visual input sent to the optic-lobe sensory neurons.
-    if (frameRef.current % 3 === 0 && rtRef.current && eyeCamRef.current) {
-      const eyeCam = eyeCamRef.current
-      eyeCam.position.set(s.x, s.y, s.z)
-      eyeCam.rotation.set(0, s.heading, 0)
-      eyeCam.updateMatrixWorld()
-      const rt = rtRef.current
-      gl.setRenderTarget(rt)
-      gl.render(scene, eyeCam)
-      gl.setRenderTarget(null)
-      const buf = new Uint8Array(16 * 8 * 4)
-      gl.readRenderTargetPixels(rt, 0, 0, 16, 8, buf)
-      let leftSum = 0, rightSum = 0
-      for (let row = 0; row < 8; row++) {
-        for (let col = 0; col < 16; col++) {
-          const idx = (row * 16 + col) * 4
-          const lum = (buf[idx] + buf[idx + 1] + buf[idx + 2]) / (3 * 255)
-          if (col < 8) leftSum += lum; else rightSum += lum
-        }
-      }
-      sendVisual(leftSum / 64, rightSum / 64)
+    if (frameRef.current % 10 === 0 && sendCmd) {
+      const boost = stamina < STAMINA_LOW ? STAMINA_MAX_THRESHOLD_BOOST_MV * (1 - staminaFrac) : 0
+      sendCmd({ cmd: 'set_params', motor_threshold_boost: boost })
     }
   })
 
   return null
 }
 
-function ParkScene({ flightCmdRef, flightStateRef, trailRef, sendVisual, debugRef, onCollision }) {
+function SandboxScene({ flightCmdRef, flightStateRef, staminaRef, sendCmd }) {
   return (
     <>
-      <Park flightStateRef={flightStateRef} debugRef={debugRef} />
+      <color attach="background" args={['#05070c']} />
+      <ambientLight intensity={0.9} />
       <FlyAvatar flightStateRef={flightStateRef} />
-      <FlightRig
-        flightCmdRef={flightCmdRef} flightStateRef={flightStateRef}
-        trailRef={trailRef} sendVisual={sendVisual} debugRef={debugRef} onCollision={onCollision}
-      />
+      <FlyRig flightCmdRef={flightCmdRef} flightStateRef={flightStateRef} staminaRef={staminaRef} sendCmd={sendCmd} />
+      <OrbitControls enableDamping dampingFactor={0.08} rotateSpeed={0.5} makeDefault />
     </>
+  )
+}
+
+// ---------------------------------------------------------------------
+// Sensory manipulation — the Neural Sandbox's core feature. Each channel is
+// a real neuPrint population (see BrainLIF._group_masks in run_simulation.py
+// for the same match logic applied server-side for continuous drive):
+// ol_sensory split by soma side for the two eyes, cb_sensory neurons typed
+// "JO-*" for the real antennal mechanoreceptor organ (Johnston's Organ),
+// cb_sensory neurons typed "ORN" for real antennal Olfactory Receptor
+// Neurons, and the whole vnc_sensory superclass for real leg/body touch
+// afferents. Nothing here is an invented category.
+// ---------------------------------------------------------------------
+
+const SENSORY_CHANNELS = [
+  { key: 'optic_L', label: 'Optic lobe · L', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'L' },
+  { key: 'optic_R', label: 'Optic lobe · R', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'R' },
+  { key: 'antennal', label: "Antennal (Johnston's Organ)", match: (n) => (n.type || '').startsWith('JO') },
+  { key: 'olfactory', label: 'Olfactory (ORN)', match: (n) => n.type === 'ORN' },
+  { key: 'leg_body', label: 'Leg / body mechanoreceptors', match: (n) => n.superclass === 'vnc_sensory' },
+]
+
+function sampleIds(ids, n) {
+  if (ids.length <= n) return ids
+  const out = []; const used = new Set()
+  while (out.length < n) {
+    const i = Math.floor(Math.random() * ids.length)
+    if (used.has(i)) continue
+    used.add(i); out.push(ids[i])
+  }
+  return out
+}
+
+function SensoryPanel({ graph, sendCmd, groupDrive }) {
+  const [local, setLocal] = useState({})
+  useEffect(() => { if (groupDrive) setLocal(groupDrive) }, [groupDrive])
+
+  const idsByChannel = useMemo(() => {
+    const out = {}
+    for (const ch of SENSORY_CHANNELS) out[ch.key] = graph.nodes.filter(ch.match).map((n) => n.id)
+    return out
+  }, [graph])
+
+  return (
+    <div className="hero-overlay panel" style={{ top: 16, right: 16, minWidth: 250, maxHeight: 'calc(100% - 32px)', overflowY: 'auto' }}>
+      <div className="title">sensory manipulation</div>
+      {SENSORY_CHANNELS.map((ch) => {
+        const ids = idsByChannel[ch.key]
+        const rate = local[ch.key] ?? 0
+        return (
+          <div key={ch.key} className="control-row">
+            <div style={{ marginBottom: 4 }}>{ch.label} <span style={{ opacity: 0.6 }}>({ids.length})</span></div>
+            <div className="control-row buttons" style={{ marginBottom: 6 }}>
+              <button
+                className="btn" disabled={!ids.length}
+                onClick={() => sendCmd({ cmd: 'inject_spike', body_ids: sampleIds(ids, 60) })}
+              >
+                spike
+              </button>
+            </div>
+            <label className="slider-label">
+              continuous drive: {rate.toFixed(2)}
+              <input
+                type="range" min="0" max="3" step="0.05" value={rate}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value)
+                  setLocal((s) => ({ ...s, [ch.key]: v }))
+                  sendCmd({ cmd: 'set_group_drive', group: ch.key, rate: v })
+                }}
+              />
+            </label>
+          </div>
+        )
+      })}
+    </div>
   )
 }
 
@@ -723,45 +592,6 @@ function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connecte
   )
 }
 
-function Minimap({ trailRef }) {
-  const canvasRef = useRef()
-  useEffect(() => {
-    let raf
-    const draw = () => {
-      const canvas = canvasRef.current
-      if (canvas) {
-        const ctx = canvas.getContext('2d')
-        const w = canvas.width, h = canvas.height
-        ctx.fillStyle = 'rgba(5,7,12,0.35)'
-        ctx.fillRect(0, 0, w, h)
-        const trail = trailRef.current
-        if (trail.length > 1) {
-          // Fly-centered, not world-origin-centered — same class of bug as
-          // the static tree patch (see Park/ParkChunks above and the
-          // AGENTS.md entry): drawing at `w/2 + x*3` put the trail off the
-          // 150x150 canvas entirely once the fly was more than ~25 world
-          // units from the origin, which after any real flight duration it
-          // always is. Anchor on the fly's own current position instead.
-          const [fx, fz] = trail[trail.length - 1]
-          ctx.strokeStyle = '#4fa3ff'; ctx.lineWidth = 1.5
-          ctx.beginPath()
-          trail.forEach(([x, z], i) => {
-            const px = w / 2 + (x - fx) * 3, py = h / 2 - (z - fz) * 3
-            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py)
-          })
-          ctx.stroke()
-          ctx.fillStyle = '#ff6644'
-          ctx.beginPath(); ctx.arc(w / 2, h / 2, 3.5, 0, 2 * Math.PI); ctx.fill()
-        }
-      }
-      raf = requestAnimationFrame(draw)
-    }
-    raf = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(raf)
-  }, [trailRef])
-  return <canvas ref={canvasRef} width={150} height={150} className="minimap" />
-}
-
 // ---------------------------------------------------------------------
 // Main dashboard
 // ---------------------------------------------------------------------
@@ -772,30 +602,26 @@ export default function Dashboard() {
   const [connected, setConnected] = useState(false)
   const [stats, setStats] = useState({
     t: 0, thrust: 0.5, yawRate: 0, nSpiking: 0,
-    paused: false, sensoryDrive: null, noiseStd: null, visualL: 0.5, visualR: 0.5,
-    rewardSignal: 0, cumulativeReward: 0, learningEnabled: false,
+    paused: false, sensoryDrive: null, noiseStd: null,
+    rewardSignal: 0, cumulativeReward: 0, learningEnabled: false, groupDrive: null,
   })
 
   const spikeQueueRef = useRef(null)
-  const trailRef = useRef([])
   const wsRef = useRef(null)
   const flightCmdRef = useRef({ thrust: 0.5, yaw_rate: 0 })
-  const flightStateRef = useRef({ x: 0, y: 3, z: 0, heading: 0 })
+  const flightStateRef = useRef({ x: 0, y: 0, z: 0, heading: 0, thrust: 0 })
   // Sent only every ~30 broadcast ticks (bandwidth — see telemetry_server.py);
   // kept as a plain ref holding the last-received map so BrainInstances
   // always has *something* to read even on ticks that didn't carry it.
   const plasticWeightRef = useRef(null)
 
-  // TEMP DIAGNOSTIC (Prompt 1 investigation) — plain ref written every
-  // frame by Park/FlightRig, polled here on an interval (not per-frame, to
-  // avoid re-rendering the whole tree 60x/sec) and shown as an always-on
-  // HTML overlay. This is plain React/DOM text, independent of whatever
-  // WebGL is or isn't doing, so it isolates "did the JS logic run
-  // correctly" from "did the GPU actually draw it".
-  const debugRef = useRef({})
-  const [debugDisplay, setDebugDisplay] = useState({})
+  // Stamina is computed every frame in FlyRig (client-side, since flight
+  // kinematics live there) — polled on its own faster interval so the HUD
+  // bar reads as live feedback rather than the 500ms debug-overlay cadence.
+  const staminaRef = useRef(STAMINA_MAX)
+  const [staminaDisplay, setStaminaDisplay] = useState(STAMINA_MAX)
   useEffect(() => {
-    const id = setInterval(() => setDebugDisplay({ ...debugRef.current }), 500)
+    const id = setInterval(() => setStaminaDisplay(staminaRef.current), 150)
     return () => clearInterval(id)
   }, [])
 
@@ -822,9 +648,8 @@ export default function Dashboard() {
         setStats({
           t: d.t, thrust: d.thrust, yawRate: d.yaw_rate, nSpiking: d.spiking_ids.length,
           paused: !!d.paused, sensoryDrive: d.sensory_drive ?? null, noiseStd: d.noise_std ?? null,
-          visualL: d.visual_L ?? 0.5, visualR: d.visual_R ?? 0.5,
           rewardSignal: d.reward_signal ?? 0, cumulativeReward: d.cumulative_reward ?? 0,
-          learningEnabled: !!d.learning_enabled,
+          learningEnabled: !!d.learning_enabled, groupDrive: d.group_drive ?? null,
         })
       }
     }
@@ -836,76 +661,45 @@ export default function Dashboard() {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(cmd))
     if (cmd.cmd === 'reset') {
-      flightStateRef.current = { x: 0, y: 3, z: 0, heading: 0 }
-      trailRef.current = []
-    }
-  }, [])
-
-  const sendVisual = useCallback((left, right) => {
-    const ws = wsRef.current
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ cmd: 'visual_input', left, right }))
+      flightStateRef.current = { x: 0, y: 0, z: 0, heading: 0, thrust: 0 }
+      staminaRef.current = STAMINA_MAX
     }
   }, [])
 
   const layout = useBrainLayout(graph ?? { nodes: [], edges: [] })
-  // Obstacle-avoidance task (Prompt 2, step 5): a real tree collision fires
-  // the real PPL (aversive) population via the same inject_spike path the
-  // manual control-panel buttons use — no separate backend mechanism.
-  const pplIds = useMemo(
-    () => (graph?.nodes ?? []).filter((n) => n.class === 'DAN' && (n.type || '').startsWith('PPL')).map((n) => n.id),
-    [graph],
-  )
-  const onCollision = useCallback(() => {
-    sendCmd({ cmd: 'inject_spike', body_ids: pplIds })
-  }, [sendCmd, pplIds])
 
   if (error) return <div className="panel error">{error}</div>
   if (!graph) return <div className="panel">Loading brain_graph.json...</div>
 
   return (
     <div className="dashboard-root">
-      {/* HERO: fly's-eye view flying through the park */}
+      {/* HERO: Pure Neural Sandbox — fly body state, no park/world */}
       <div className="hero-fly">
-        <Canvas camera={{ fov: 60, position: [0, 4.8, -3.5] }}>
-          <ParkScene
-            flightCmdRef={flightCmdRef} flightStateRef={flightStateRef} trailRef={trailRef}
-            sendVisual={sendVisual} debugRef={debugRef} onCollision={onCollision}
+        <Canvas camera={{ fov: 45, position: [0, 0.6, 1.8] }}>
+          <SandboxScene
+            flightCmdRef={flightCmdRef} flightStateRef={flightStateRef}
+            staminaRef={staminaRef} sendCmd={sendCmd}
           />
         </Canvas>
-        <div className="hero-overlay panel" style={{ top: 140, left: 16, fontSize: 10, opacity: 0.85 }}>
-          <div className="title">TEMP DIAGNOSTIC (Prompt 1)</div>
-          <div>nearby trees: {debugDisplay.nearbyTreeCount ?? '—'} (active cells: {debugDisplay.activeCellCount ?? '—'}, center: {JSON.stringify(debugDisplay.centerCell ?? null)})</div>
-          <div>flyPos: {JSON.stringify(debugDisplay.flyPos ?? null)}  heading: {debugDisplay.heading ?? '—'}</div>
-          <div>camPos: {JSON.stringify(debugDisplay.camPos ?? null)}</div>
-          <div>trailRef.length: {debugDisplay.trailLen ?? '—'}</div>
-        </div>
         <div className="hero-overlay top-left panel">
-          <div className="title">vision-first flight / virtual park</div>
+          <div className="title">fly body state</div>
           <div>t = {stats.t.toFixed(3)}s{stats.paused ? '  ·  PAUSED' : ''}</div>
-          <div>thrust {stats.thrust.toFixed(2)} · yaw {stats.yawRate.toFixed(2)}</div>
+          <div>thrust {stats.thrust.toFixed(2)} · yaw {stats.yawRate.toFixed(2)} · spiking: {stats.nSpiking}</div>
+          <DriveBar label="stamina" value={staminaDisplay} range={[0, STAMINA_MAX]} />
+          {staminaDisplay < STAMINA_LOW && <div style={{ color: '#cc4422' }}>fatigued — sluggish</div>}
         </div>
-        <div className="hero-overlay bottom-left panel">
-          <div className="title">position (top-down)</div>
-          <Minimap trailRef={trailRef} />
-        </div>
-        <div className="hero-overlay top-right panel">
-          <div className="title">compound eye input</div>
-          <DriveBar label="L" value={stats.visualL} range={[0, 1]} />
-          <DriveBar label="R" value={stats.visualR} range={[0, 1]} />
-          <div>spiking this tick: {stats.nSpiking}</div>
-        </div>
-        <div className="hero-overlay panel" style={{ top: 140, right: 16, minWidth: 170 }}>
+        <div className="hero-overlay panel" style={{ top: 140, left: 16, minWidth: 170 }}>
           <div className="title">mushroom-body learning</div>
           <div>{stats.learningEnabled ? '● learning ON' : '○ learning off'}</div>
           <DriveBar label="reward" value={stats.rewardSignal} range={[-0.2, 0.2]} />
           <div>cumulative: {stats.cumulativeReward.toFixed(2)}</div>
         </div>
+        <SensoryPanel graph={graph} sendCmd={sendCmd} groupDrive={stats.groupDrive} />
       </div>
 
       <div className="side-col">
         <div className="brain-view">
-          <Canvas camera={{ position: [0, 0, 6], fov: 50 }}>
+          <Canvas dpr={[1, 1.5]} camera={{ position: [0, 0, 6], fov: 50 }}>
             <BrainScene layout={layout} spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef} />
           </Canvas>
           <div className="hud top-left panel small">

@@ -74,6 +74,10 @@ class SimWorker:
                     self.bridge.brain.sensory_drive = float(cmd["sensory_drive"])
                 if "noise_std" in cmd:
                     self.bridge.brain.noise_std = float(cmd["noise_std"])
+                if "motor_threshold_boost" in cmd:
+                    self.bridge.brain.motor_threshold_boost = float(cmd["motor_threshold_boost"])
+            elif kind == "set_group_drive":
+                self.bridge.brain.set_group_drive(cmd["group"], float(cmd["rate"]))
             elif kind == "visual_input":
                 self.bridge.set_visual_input(float(cmd.get("left", 0.5)), float(cmd.get("right", 0.5)))
             elif kind == "inject_spike":
@@ -139,6 +143,8 @@ class SimWorker:
                 "paused": False,
                 "sensory_drive": bridge.brain.sensory_drive,
                 "noise_std": bridge.brain.noise_std,
+                "motor_threshold_boost": bridge.brain.motor_threshold_boost,
+                "group_drive": bridge.brain.group_drive,
                 "visual_L": bridge.brain.visual_L,
                 "visual_R": bridge.brain.visual_R,
                 "reward_signal": snap.reward_signal,
