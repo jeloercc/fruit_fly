@@ -4,6 +4,8 @@ __pycache__/
 .env
 data/checkpoints/
 data/*.json
+data/*.parquet
+data/*.bin
 data/*.mp4
 data/*.log
 
