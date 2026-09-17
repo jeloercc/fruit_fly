@@ -6,6 +6,8 @@ telemetry dashboard: a procedural closed-loop optic-flow tunnel, the real 3D
 connectome morphology, a sensory ommatidia matrix, a spike raster, and
 mushroom-body dopamine/reward metrics.
 
+[![Fruit Fly Simulation Demo](https://img.youtube.com/vi/CQzLku5Q6Is/0.jpg)](https://www.youtube.com/watch?v=CQzLku5Q6Is)
+
 Two processes, both required:
 
 - **Backend** (`telemetry_server.py`) — FastAPI + WebSocket server that steps
