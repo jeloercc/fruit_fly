@@ -15,21 +15,47 @@ html, body, #root {
   overflow: hidden;
 }
 
+/* Nested grid, not a single grid-template-areas: the top row (M1|M2) and
+   bottom row (M3|M4|M5) split independently, so a single unified column
+   track list can't express both — see useResizableGrid in dashboard.jsx,
+   which sets --row-h/--col-top/--col-bot-a/--col-bot-b as pixel values on
+   this root element directly (never through React state — a resize drag
+   fires far faster than 60Hz and every module holds a live canvas). The
+   percentage fallbacks below only show for one frame before that JS runs
+   (useLayoutEffect, before paint). */
 .dashboard-root {
   position: fixed;
   inset: 0;
   height: 100vh;
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  grid-template-rows: 58% 42%;
-  grid-template-areas:
-    "m1 m1 m1 m2 m2 m2"
-    "m3 m3 m4 m4 m5 m5";
+  grid-template-rows: var(--row-h, 58%) 6px 1fr;
   background: var(--bg);
   font-family: 'SF Mono', 'JetBrains Mono', monospace;
   color: var(--text);
   overflow: hidden;
 }
+
+.row-top {
+  display: grid;
+  grid-template-columns: var(--col-top, 50%) 6px 1fr;
+  min-width: 0;
+  min-height: 0;
+}
+
+.row-bottom {
+  display: grid;
+  grid-template-columns: var(--col-bot-a, 33.3%) 6px var(--col-bot-b, 33.3%) 6px 1fr;
+  min-width: 0;
+  min-height: 0;
+}
+
+.splitter {
+  background: var(--border);
+  z-index: 30;
+}
+.splitter-vertical { cursor: col-resize; width: 6px; touch-action: none; }
+.splitter-horizontal { cursor: row-resize; height: 6px; touch-action: none; }
+.splitter:hover, .splitter:active { background: var(--accent-blue); }
 
 .module {
   position: relative;
@@ -41,12 +67,6 @@ html, body, #root {
 }
 
 .module canvas { display: block; }
-
-.module-1 { grid-area: m1; }
-.module-2 { grid-area: m2; }
-.module-3 { grid-area: m3; }
-.module-4 { grid-area: m4; }
-.module-5 { grid-area: m5; }
 
 .module-label {
   position: absolute;
@@ -115,6 +135,49 @@ html, body, #root {
   overflow-y: auto;
 }
 
+.region-info {
+  bottom: 10px;
+  right: 10px;
+  min-width: 170px;
+}
+
+.region-pills {
+  position: absolute;
+  z-index: 10;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+}
+
+.region-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 10, 10, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.region-pill:hover { background: rgba(30, 30, 30, 0.9); }
+.region-pill.active { border-color: var(--dot); background: rgba(255, 255, 255, 0.06); }
+
+.region-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dot);
+  box-shadow: 0 0 6px var(--dot);
+  flex-shrink: 0;
+}
+
 .panel.error {
   position: fixed;
   inset: 0;
@@ -132,6 +195,34 @@ html, body, #root {
   margin-bottom: 6px;
   letter-spacing: 0.02em;
 }
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.panel-header .title { margin-bottom: 0; }
+
+.collapse-caret {
+  color: var(--text-dim);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+/* Collapsed: header-only pill, no body, no leftover padding/min-width
+   from the panel's own positioning class. */
+.panel.collapsed {
+  padding: 8px 12px;
+  min-width: 0;
+  max-width: none;
+  max-height: none;
+  overflow: visible;
+}
+
+.panel-body { margin-top: 8px; }
 
 .control-row { margin-bottom: 10px; }
 .control-row.buttons { display: flex; gap: 8px; }
@@ -176,15 +267,19 @@ html, body, #root {
 /* ---------------- Small screens: stack instead of the strict grid ---------------- */
 
 @media (max-width: 900px) {
+  /* Dragging to resize doesn't make sense at this width — stack everything
+     and let the splitters disappear rather than try to keep them usable. */
   .dashboard-root {
-    grid-template-columns: 1fr;
-    grid-template-rows: repeat(5, 20vh);
-    grid-template-areas:
-      "m1"
-      "m2"
-      "m3"
-      "m4"
-      "m5";
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
     overflow-y: auto;
   }
+  .row-top, .row-bottom {
+    display: flex;
+    flex-direction: column;
+  }
+  .module { height: 45vh; flex-shrink: 0; }
+  .splitter { display: none; }
 }

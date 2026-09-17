@@ -143,7 +143,23 @@ class BrainLIF:
         dn_rate_tau: float = 0.08,
         seed: int = 0,
         plasticity_enabled: bool = False,
-        plasticity_eta: float = 0.15,
+        # Was 0.15. With sustained dopamine that drove every plastic synapse
+        # in both compartments into the -90% clip floor within ~240 steps
+        # (measured: -85.0% / -85.9%), which is saturation, not learning —
+        # a saturated synapse cannot encode anything. Baseline subtraction
+        # (see pam_baseline/ppl_baseline) already cuts the effective
+        # dopamine term several-fold. A first attempt at 0.05 was still
+        # far too high — 19,283 of 21,573 PAM-compartment synapses still
+        # hit the -90% clip floor. 0.005 also saturated (-87%) once the
+        # dopamine EMAs were properly warmed to steady state, which raises
+        # the effective drive ~3.4x (d_PAM 0.067 -> 0.23) relative to the
+        # earlier cold-start tests. Sized arithmetically instead of by
+        # guessing: cumulative depression over one 240-step episode is
+        # ~eta * elig * d_dopa * sub_dt * 960 substeps; with elig~50 and
+        # d_dopa~0.22 that gives ~26x the weight at 0.005 (hence the floor)
+        # and ~0.26 — a ~25% depression, the intended non-saturating range —
+        # at 5e-5.
+        plasticity_eta: float = 5e-5,
         # Swept 2000/1000/500/200/100ms against a realistic multi-pulse PPL
         # protocol (8 forced-aversive events over 150 outer steps, same as
         # a real learning episode would look like) and measured fraction of
@@ -158,7 +174,22 @@ class BrainLIF:
         # time constant. Left at the literature-grounded 2000ms rather
         # than shortened on a mechanism that measurably doesn't help.
         tau_elig_ms: float = 2000.0,
-        dopamine_rate_tau: float = 0.5,
+        # Was 0.5s. At the tunnel's 0.3s appetitive-burst cadence (see
+        # dashboard.jsx TunnelRig), a 0.5s EMA mostly decayed back toward
+        # baseline between pulses before the next one landed — sustained
+        # full-PAM stimulation over 5s measured live only reached -0.156
+        # from a -0.20 baseline (see AGENTS.md-style reasoning in the
+        # dopamine_baseline comment below). A longer time constant lets
+        # bursts arriving faster than it decays actually compound instead
+        # of mostly resetting each cycle.
+        dopamine_rate_tau: float = 1.5,
+        # First-order muscle-activation (calcium-dynamics-style) filter
+        # time constant for the VNC efferent pathway — see
+        # motor_activation()/step() below. Not neuPrint-derived (there's no
+        # calcium-imaging data in this connectome), a literature-typical
+        # insect-muscle activation timescale used as a first-pass constant,
+        # same status as DN_RATE_TO_DRIVE_GAIN-style gains elsewhere.
+        muscle_tau_s: float = 0.05,
     ):
         # `dt` (seconds) is the outer cadence at which the bridge calls
         # step() — tied to the physics-coupling rate, not the brain's own
@@ -171,6 +202,7 @@ class BrainLIF:
 
         self.sensory_drive = sensory_drive   # multiplier on R_POI for sensory neurons
         self.noise_std = noise_std           # background Poisson rate (Hz) for ALL neurons — our addition
+        self.dt = dt  # outer timestep (s) — needed to express rates in Hz
         self.dn_rate_alpha = dt / dn_rate_tau
         self.rng = np.random.default_rng(seed)
 
@@ -179,7 +211,54 @@ class BrainLIF:
         self.elig_decay_per_substep = np.exp(-self.SUB_DT / tau_elig_ms)
         self.dopamine_rate_alpha = dt / dopamine_rate_tau
         self.dopamine_rate = 0.0       # signed EMA: PAM(reward) - PPL(punishment)
+        # Empirically measured resting-state value of dopamine_rate with
+        # zero stimulation, purely from ambient noise/sensory_drive (-0.20
+        # to -0.21 across repeated live measurements). This is a real
+        # network property, not fabricated — but it's a normalization
+        # artifact, not evidence that PPL is "more excitable": PPL is only
+        # 24 neurons vs PAM's 316, so the same handful of noise-driven
+        # spikes produces a far larger *fractional* population rate for
+        # PPL than for PAM (mean-fraction over a small N is a
+        # high-variance, upward-biased estimator). dopamine_rate itself
+        # (used for plasticity below, real biological signal) is left
+        # exactly as-is; this constant only recenters what gets *reported*
+        # as reward — see reward_signal/cumulative_reward in step().
+        self.dopamine_baseline = -0.20
         self.cumulative_reward = 0.0
+        # Unsigned per-compartment dopamine levels — the third factor for
+        # the compartment-specific depression rule (see step()/_substep).
+        self.pam_level = 0.0
+        self.ppl_level = 0.0
+        # Empirically measured resting levels of the two EMAs above, with
+        # zero stimulation and learning frozen (400 steps, mean of the last
+        # 250): PAM 0.04632 +- 0.01033, PPL 0.10821 +- 0.02400. The 2.34x
+        # ratio is the small-N artifact, not higher PPL excitability — PPL
+        # is 24 cells vs PAM's 316, so identical noise yields a much larger
+        # population fraction. Subtracted in _substep so an unstimulated
+        # network produces exactly zero weight change (dopamine
+        # reuptake/clearance, functionally).
+        self.pam_baseline = 0.046
+        self.ppl_baseline = 0.108
+        # SYNTHETIC diagnostic toggle — see the clamp block in _substep.
+        # Default OFF: the honest model lets the two DAN populations
+        # cross-talk, because that is what the connectome does.
+        self.dan_clamp = False
+        # By-intention clamp state. When dan_clamp is ON, the valence the
+        # USER most recently injected (not the measured EMAs) decides which
+        # compartment may learn. Latched for dan_intent_window outer steps,
+        # sized to the dopamine EMA's own time constant so the window covers
+        # the period over which that volley's dopamine is actually elevated.
+        self.dan_intent = None          # 'PAM' | 'PPL' | None
+        self.dan_intent_left = 0        # outer steps remaining
+        self.dan_intent_window = int(round(dopamine_rate_tau / dt))
+
+        # VNC efferent pathway: real leg motor-neuron output, filtered
+        # through a muscle-activation leaky integrator (see step()). Kept
+        # as brain state (not physics_worker.py's) since it's the SNN's own
+        # readout being smoothed, same category as dn_rate/dopamine_rate.
+        self.muscle_alpha = dt / muscle_tau_s
+        self.muscle_activation_left = 0.0
+        self.muscle_activation_right = 0.0
 
         # Stamina/fatigue effect (frontend-driven, see dashboard.jsx
         # FlightRig): an additive mV offset applied only to DN (motor
@@ -208,9 +287,20 @@ class BrainLIF:
         # fetches instead; regenerated every time (cheap relative to the
         # json.load above) so a graph swap (watch_and_swap.py) can't leave a
         # stale one behind.
+        # Written via a temp file + atomic rename, not in place: the
+        # frontend's static-file GET for this exact path can land while a
+        # fresh backend is still mid-json.dump() (a 37MB write isn't
+        # instantaneous), and StaticFiles computes Content-Length from an
+        # early stat() of the file — if the file keeps growing under it
+        # while streaming, uvicorn raises "Response content longer than
+        # Content-Length". Path.replace() is an atomic rename on POSIX, so
+        # a concurrent reader only ever sees the old complete file or the
+        # new complete file, never a partially-written one.
         nodes_sidecar_path = Path(graph_path).with_name(Path(graph_path).stem + "_nodes.json")
-        with open(nodes_sidecar_path, "w") as f:
+        tmp_sidecar_path = nodes_sidecar_path.with_suffix(".json.tmp")
+        with open(tmp_sidecar_path, "w") as f:
             json.dump({"meta": graph.get("meta", {}), "nodes": nodes}, f)
+        tmp_sidecar_path.replace(nodes_sidecar_path)
         log.info("wrote nodes-only sidecar for dashboard: %s (%.1f MB, dropped %d edges)",
                   nodes_sidecar_path, nodes_sidecar_path.stat().st_size / 1e6, len(edges))
         self.body_ids = np.array([n["id"] for n in nodes], dtype=np.int64)
@@ -228,6 +318,40 @@ class BrainLIF:
         # symmetric "forward drive" pool, just not toward the L/R split.
         self.dn_unsided = self.is_dn & ~(soma_side == "L") & ~(soma_side == "R")
 
+        # VNC efferent pathway: real leg motor neurons (superclass
+        # 'vnc_motor', 708 neurons — genuine neuPrint population, types
+        # like "Ti flexor MN"/"Fe reductor MN"/"Ta levator MN"/etc., named
+        # after the real muscle/joint they act on). male-cns:v1.0 has no
+        # per-leg (T1/T2/T3, i.e. fore/mid/hind) identity field on these —
+        # only soma_side — so L/R pooled firing rate is the finest honest
+        # split available; see motor_activation()/step() for the filter
+        # that turns this into the physics process's actual drive signal.
+        # Defined once here — used by the DN/photoreceptor/sensory-channel
+        # masks throughout the rest of __init__.
+        type_str = np.array([(n.get("type") or "") for n in nodes])
+
+        is_vnc_motor = superclass == "vnc_motor"
+        self.is_vnc_motor = is_vnc_motor
+        self.mn_left = is_vnc_motor & (soma_side == "L")
+        self.mn_right = is_vnc_motor & (soma_side == "R")
+
+        # Named locomotor DNs from the literature, confirmed present in
+        # this dataset by direct query (counts are small because these are
+        # individually-identified cell types, not populations): DNb01 (2)
+        # and DNb02 (4) are the forward-drive pair; DNp09 (2) is the
+        # stopping/freezing DN. All three verified to synapse onto real
+        # vnc_motor neurons here (651 / 337 / 77 synapses respectively), so
+        # they are genuinely part of the efferent path, not just present.
+        # With only 2-4 cells each their population rate is a very
+        # high-variance estimator (the same small-N problem documented for
+        # PPL in dopamine_baseline above) — reported for observability,
+        # NOT used as the motor drive signal. See dn_premotor below.
+        self.dn_named = {
+            "DNb01": self.is_dn & (type_str == "DNb01"),
+            "DNb02": self.is_dn & (type_str == "DNb02"),
+            "DNp09": self.is_dn & (type_str == "DNp09"),
+        }
+
         # Vision-first pivot: sensory neurons are the optic-lobe input layer
         # (ol_sensory — real neuPrint superclass for the compound-eye-adjacent
         # photoreceptor/lamina neurons), split L/R by soma side since that's
@@ -235,11 +359,60 @@ class BrainLIF:
         # — we don't have per-ommatidium retinotopic coordinates, so this is
         # the coarsest honest mapping: left-eye brightness drives left-soma
         # sensory neurons, right-eye brightness drives right-soma ones.
-        self.is_sensory_left = self.is_sensory & (soma_side == "L")
-        self.is_sensory_right = self.is_sensory & (soma_side == "R")
-        self.is_sensory_unsided = self.is_sensory & ~(soma_side == "L") & ~(soma_side == "R")
+        # Eye side comes from `instance`, NOT `soma_side`. Measured on this
+        # dataset: of the 6,098 ol_sensory photoreceptors, soma_side is
+        # null for 6,062 of them (only 23 L / 13 R annotated) — so keying
+        # the visual split on soma_side silently routed 99.4% of the
+        # retina into the "unsided" bucket, where it received the MEAN of
+        # both eyes and could never encode a left/right difference at all.
+        # `instance` carries the real side as a suffix ("R1-R6_L",
+        # "R7y_R", ...) and covers 100% of them: L=2,349, R=3,749, 0
+        # unsided. Same suffix convention is used across the other sensory
+        # superclasses, so this is applied to is_sensory as a whole.
+        instance = np.array([n.get("instance") or "" for n in nodes])
+        side_L = np.char.endswith(instance, "_L") | (soma_side == "L")
+        side_R = np.char.endswith(instance, "_R") | (soma_side == "R")
+        self.is_sensory_left = self.is_sensory & side_L
+        self.is_sensory_right = self.is_sensory & side_R
+        self.is_sensory_unsided = self.is_sensory & ~side_L & ~side_R
         self.visual_L = 0.5  # normalized brightness (0..1), set live by set_visual_input()
         self.visual_R = 0.5
+
+        # Real photoreceptor classes, straight off the connectome's own
+        # `type` field within ol_sensory (counts measured on this dataset):
+        #   R1-R6          3,377 — broadband outer photoreceptors
+        #                          (motion/luminance)
+        #   pale R7/R8       662 — one spectral subtype
+        #   yellow R7/R8     963 — the other spectral subtype
+        #   unclear R7/R8  1,096 — annotated R7/R8 but subtype not resolved
+        # flygym's retina reports the SAME pale/yellow distinction via its
+        # own pale_type_mask (216 pale / 505 yellow of 721 ommatidia), so
+        # the visual afference below is class-matched on both ends rather
+        # than collapsed to a single brightness scalar. Per-ommatidium
+        # retinotopy is NOT claimed: male-cns:v1.0 gives these neurons no
+        # coordinates (soma is [None,None,None] for all of them), so eye
+        # side + spectral class is the finest honest split available.
+        type_ol = np.array([(n.get("type") or "") for n in nodes])
+        is_ol_sensory = superclass == "ol_sensory"
+        is_r16 = is_ol_sensory & np.char.startswith(type_ol, "R1-R6")
+        is_r78 = is_ol_sensory & (np.char.startswith(type_ol, "R7") | np.char.startswith(type_ol, "R8"))
+        # Subtype suffix: "R7p"/"R8p" = pale, "R7y"/"R8y" = yellow. The
+        # "_unclear" ones match neither and are deliberately left out of
+        # both spectral groups rather than guessed into one.
+        is_pale = is_r78 & np.char.endswith(type_ol, "p")
+        is_yellow = is_r78 & np.char.endswith(type_ol, "y")
+        self.photoreceptor_masks = {
+            "broadband_L": is_r16 & side_L,
+            "broadband_R": is_r16 & side_R,
+            "pale_L": is_pale & side_L,
+            "pale_R": is_pale & side_R,
+            "yellow_L": is_yellow & side_L,
+            "yellow_R": is_yellow & side_R,
+        }
+        # Per-class drive levels (0..1 luminance), written by
+        # set_visual_afference() and injected as Poisson current in
+        # _substep — the real retinal input path.
+        self.visual_afference = {k: 0.0 for k in self.photoreceptor_masks}
 
         # Neural Sandbox: manually-controllable sensory channels, each a real
         # neuPrint population (not invented categories) identified by `type`
@@ -259,14 +432,65 @@ class BrainLIF:
         # (0 = off), applied additively in _substep — independent of
         # sensory_drive/visual_L/R, which remain the camera-driven pathway.
         is_ol = superclass == "ol_sensory"
-        type_str = np.array([(n.get("type") or "") for n in nodes])
+        # tarsal_contact/chordotonal: real sub-populations within
+        # vnc_sensory, identified by their actual neuPrint `type` prefix —
+        # SNta* (2,573 neurons — "sensory neuron, tarsal", genuine
+        # touch/ground-contact afferents) and SNch* (124 neurons — genuine
+        # chordotonal-organ joint-stretch proprioceptors). Distinct from the
+        # existing "leg_body" manual-slider channel (the whole vnc_sensory
+        # superclass) so real physical telemetry from physics_worker.py
+        # (see telemetry_server.py's SimWorker._run) never fights with the
+        # user's own manual sensory-injection slider on the same group.
+        is_vnc_sensory = superclass == "vnc_sensory"
         self._group_masks = {
-            "optic_L": is_ol & (soma_side == "L"),
-            "optic_R": is_ol & (soma_side == "R"),
+            # Eye side from `instance`, not soma_side — see the eye-split
+            # note above (soma_side is null for 99.4% of photoreceptors).
+            "optic_L": is_ol & side_L,
+            "optic_R": is_ol & side_R,
             "antennal": np.char.startswith(type_str, "JO"),
-            "olfactory": type_str == "ORN",
-            "leg_body": superclass == "vnc_sensory",
+            # Real ORNs carry their target antennal-lobe glomerulus in the
+            # type ("ORN_DA1", "ORN_VA1d", ... — 2,635 of them). NO neuron
+            # in male-cns:v1.0 is typed bare "ORN", so the previous exact
+            # match `type_str == "ORN"` selected an EMPTY set and this
+            # channel silently injected nothing at all.
+            "olfactory": np.char.startswith(type_str, "ORN"),
+            "leg_body": is_vnc_sensory,
+            "tarsal_contact": is_vnc_sensory & np.char.startswith(type_str, "SNta"),
+            "chordotonal": is_vnc_sensory & np.char.startswith(type_str, "SNch"),
         }
+
+        # ---- Valence-specific, lateralized stimulus channels -------------
+        # All 53 real antennal-lobe glomeruli are present in this dataset as
+        # ORN_<glomerulus> types, so a stimulus can be aimed at a specific
+        # olfactory channel instead of the whole receptor population.
+        #
+        # FOOD (attractive): the canonical attractive food-odor glomeruli —
+        #   DM1 (Or42b, apple cider vinegar), DM2 (Or22a), DM4 (Or59b),
+        #   VA2 (Or92a), VM2 (Or43b).
+        #   NOTE: VA1v is deliberately NOT included here. VA1v is the Or47b
+        #   channel, a PHEROMONE/courtship glomerulus, not a food-odor one —
+        #   including it would mislabel a mating-circuit stimulus as feeding.
+        # AVERSIVE: V is the real CO2 glomerulus (Gr21a/Gr63a); DA2 is the
+        #   geosmin channel (Or56a, microbial-danger avoidance); DL5 (Or7a).
+        #
+        # WIND/FREEZE: Johnston's Organ subtypes C/D/E — the static-
+        #   deflection units that encode wind and gravity — while A/B (sound
+        #   /vibration, 138 cells here) are excluded. JO afferents ARE the
+        #   AMMC input: this graph carries no neuropil field, so AMMC is
+        #   addressed through its afferent population, not a region label.
+        food_glom = ("ORN_DM1", "ORN_DM2", "ORN_DM4", "ORN_VA2", "ORN_VM2")
+        averse_glom = ("ORN_V", "ORN_DA2", "ORN_DL5")
+        is_food = np.isin(type_str, food_glom)
+        is_averse = np.isin(type_str, averse_glom)
+        is_wind = np.char.startswith(type_str, "JO-C") | np.char.startswith(type_str, "JO-D") \
+            | np.char.startswith(type_str, "JO-E")
+        # Lateralized so asymmetric injection can produce a real left/right
+        # motor difference. Neurons whose side is unannotated are excluded
+        # from both sides rather than duplicated into each (food 15/284,
+        # aversive 8/146, wind 0/343 are unsided here).
+        for name, mask in (("food", is_food), ("co2", is_averse), ("wind", is_wind)):
+            self._group_masks[f"{name}_L"] = mask & side_L
+            self._group_masks[f"{name}_R"] = mask & side_R
         self.group_drive = {name: 0.0 for name in self._group_masks}
 
         log.info(
@@ -296,6 +520,22 @@ class BrainLIF:
 
         self.W = sp.csr_matrix((vals, (rows, cols)), shape=(self.n, self.n))
         log.info("BrainLIF: adjacency matrix %s, nnz=%d", self.W.shape, self.W.nnz)
+
+        # Premotor DN population, derived from REAL connectivity rather
+        # than from a name list: every DN with at least one direct synapse
+        # onto a vnc_motor neuron. W is [post, pre], so the presynaptic
+        # partners of the motor rows are exactly the column indices present
+        # in those rows. Measured on this dataset: 981 of the 1,316 DNs
+        # qualify — a population large enough to give a stable rate, unlike
+        # the 2-4 cell named types in dn_named. This is the "efferent
+        # bottleneck" the motor pathway actually flows through.
+        motor_rows = self.W[self.is_vnc_motor]
+        premotor_pre = np.unique(motor_rows.indices)
+        self.dn_premotor = np.zeros(self.n, dtype=bool)
+        self.dn_premotor[premotor_pre] = True
+        self.dn_premotor &= self.is_dn
+        log.info("BrainLIF: premotor DNs (direct DN->vnc_motor synapse): %d of %d DNs",
+                 self.dn_premotor.sum(), self.is_dn.sum())
 
         # Synaptic delay ring buffer: a spike fired now reaches postsynaptic
         # conductance g only after T_DLY ms (Paul et al.), not instantly.
@@ -378,6 +618,35 @@ class BrainLIF:
         self.W0_plastic = self.W.data[self.plastic_pos].copy()
         self._w_sign_plastic = np.sign(self.W0_plastic)
         self._w_mag0_plastic = np.abs(self.W0_plastic)
+
+        # ---- Compartment assignment, derived from real DAN->MBON wiring --
+        # In Drosophila the mushroom body is organised into compartments:
+        # each dopaminergic population innervates a specific set of MBONs,
+        # and DAN activity DEPRESSES the KC->MBON synapses in *its own*
+        # compartment only. That is what makes valence learning specific
+        # rather than global.
+        #
+        # Rather than assume which MBONs belong to which compartment, this
+        # reads it out of the connectome: total synaptic input onto each
+        # MBON from PAM vs PPL neurons, requiring a 2x dominance margin so
+        # ambiguous MBONs are assigned to neither. Measured on this dataset:
+        # 38 PAM-dominant, 57 PPL-dominant of 97 MBONs (PAM contacts 49
+        # distinct MBONs with 27,090 synapses; PPL contacts 85 with 10,882).
+        Wabs = abs(self.W)
+        pam_in = np.asarray(Wabs[:, self.is_pam].sum(axis=1)).ravel()
+        ppl_in = np.asarray(Wabs[:, self.is_ppl].sum(axis=1)).ravel()
+        mbon_pam_dom = self.is_mbon & (pam_in > 2.0 * ppl_in)
+        mbon_ppl_dom = self.is_mbon & (ppl_in > 2.0 * pam_in)
+        # Per-plastic-synapse compartment membership, via its postsynaptic MBON.
+        self.plastic_in_pam_comp = mbon_pam_dom[self.plastic_post_idx]
+        self.plastic_in_ppl_comp = mbon_ppl_dom[self.plastic_post_idx]
+        log.info("plasticity: MB compartments from real DAN->MBON wiring — "
+                 "PAM-dominant MBONs=%d PPL-dominant=%d | plastic synapses: "
+                 "PAM-comp=%d PPL-comp=%d unassigned=%d",
+                 int(mbon_pam_dom.sum()), int(mbon_ppl_dom.sum()),
+                 int(self.plastic_in_pam_comp.sum()), int(self.plastic_in_ppl_comp.sum()),
+                 int(len(self.plastic_pos) - self.plastic_in_pam_comp.sum()
+                     - self.plastic_in_ppl_comp.sum()))
 
         # Integrity check, not decoration: plastic_pos/pre_idx/post_idx are
         # derived fresh from real bodyId identity (is_kc/is_mbon, computed
@@ -463,15 +732,74 @@ class BrainLIF:
             self.eligibility *= self.elig_decay_per_substep
             coincident = self.spikes[self.plastic_pre_idx] & self.spikes[self.plastic_post_idx]
             self.eligibility[coincident] += 1.0
-            if self.learning_enabled and self.dopamine_rate != 0.0:
-                # delta >= 0 in the direction of dopamine_rate's sign;
-                # applying it *along the synapse's own sign* (sign0) means
-                # reward (dopamine_rate>0) always potentiates (pushes |w|
-                # up) and punishment (dopamine_rate<0) always depresses
-                # (pushes |w| down) — for both excitatory and inhibitory
-                # synapses alike, since "stronger" means "further from
-                # zero in its own direction" either way.
-                delta = self.plasticity_eta * self.eligibility * self.dopamine_rate * dt
+            if self.learning_enabled and (self.pam_level > 0.0 or self.ppl_level > 0.0):
+                # DOPAMINE-INDUCED DEPRESSION, compartment-specific.
+                #
+                # This replaces an earlier rule that potentiated on reward
+                # and depressed on punishment. That had the sign backwards:
+                # in Drosophila, pairing an odour with DAN activity
+                # DEPRESSES the KC->MBON synapses carrying that odour in the
+                # innervated compartment (Hige et al. 2015; Cohn et al.
+                # 2015; Owald & Waddell 2015). Learning works by *removing*
+                # one MBON's vote rather than by strengthening it: an MBON
+                # driving avoidance goes quiet for the rewarded odour, so
+                # the opposing pathway wins and behaviour shifts.
+                #
+                # It is also compartment-specific, not global: PAM activity
+                # depresses only PAM-compartment synapses and PPL only
+                # PPL-compartment ones (membership read from real DAN->MBON
+                # wiring in _build_plasticity). Using the SIGNED
+                # PAM-minus-PPL difference here would be wrong twice over —
+                # it lets the two populations cancel, and it applies one
+                # valence's dopamine to the other's synapses.
+                # Noise-floor subtraction per population, the functional
+                # analogue of dopamine reuptake/clearance: trace basal
+                # dopamine must not drive continuous depression.
+                #
+                # This is NOT cosmetic. PPL has 24 cells against PAM's 316,
+                # so the same handful of noise-driven spikes yields a far
+                # larger population FRACTION for PPL (the same small-N
+                # artifact documented at dopamine_baseline). The earlier
+                # signed PAM-minus-PPL form accidentally hid this; moving to
+                # unsigned per-compartment levels exposed it, and without
+                # these baselines the PPL compartment depressed continuously
+                # at rest — measured ppl_level ~0.10 with zero punishment.
+                # Subtracting each population's own resting level restores
+                # dW = 0 for an unstimulated network.
+                d_pam = max(0.0, self.pam_level - self.pam_baseline)
+                d_ppl = max(0.0, self.ppl_level - self.ppl_baseline)
+                if self.dan_clamp and self.dan_intent is not None:
+                    # SYNTHETIC — NOT BIOLOGY. Winner-take-all mutual
+                    # inhibition between the two DAN populations, so only
+                    # the more strongly driven valence writes to its
+                    # compartment. This has NO structural correlate in
+                    # male-cns:v1.0: measured directly, PAM->PPL is 192
+                    # synapses and PPL->PAM is 453, and ALL 645 of them are
+                    # EXCITATORY — zero inhibitory. The real populations
+                    # drag each other up (D_PAM/D_PPL ratio 1.09 when PAM
+                    # alone is stimulated), which is why unclamped learning
+                    # is generalised rather than associative. Off by
+                    # default; exposed in the UI purely as a diagnostic for
+                    # observing isolated three-factor STDP dynamics.
+                    # BY INTENTION, not by measurement. An earlier version
+                    # compared the two measured EMAs winner-take-all, but
+                    # the crosstalk equalises them (d_PAM 0.2264 vs d_PPL
+                    # 0.2284, a 0.9% gap), so the winner flipped randomly
+                    # per sub-step and the net specificity was +0.50pp —
+                    # nothing. Keying off the valence the user actually
+                    # injected is the only version that discriminates. This
+                    # is MORE synthetic, not less: it ignores network state
+                    # entirely and obeys the button.
+                    if self.dan_intent == "PAM":
+                        d_ppl = 0.0
+                    else:
+                        d_pam = 0.0
+                dopa = (self.plastic_in_pam_comp * d_pam
+                        + self.plastic_in_ppl_comp * d_ppl)
+                # Negative delta => magnitude shrinks (see the sign0 factor
+                # below), i.e. depression, for excitatory and inhibitory
+                # synapses alike.
+                delta = -self.plasticity_eta * self.eligibility * dopa * dt
                 new_raw = self.W.data[self.plastic_pos] + self._w_sign_plastic * delta
                 new_mag = np.clip(np.abs(new_raw), 0.1 * self._w_mag0_plastic, 3.0 * self._w_mag0_plastic)
                 self.W.data[self.plastic_pos] = self._w_sign_plastic * new_mag
@@ -499,6 +827,19 @@ class BrainLIF:
                 | (self.is_sensory_unsided & (self.rng.random(self.n) < rate_unsided * dt / 1000.0))
             )
             self.V[fires] += self.W_SYN * self.F_POI
+
+        # Real retinal afference: per-photoreceptor-class Poisson current
+        # from the live MuJoCo compound-eye render (physics_worker.py ->
+        # set_visual_afference). Same injection mechanism as every other
+        # sensory pathway here — additive to v, not g — but keyed to the
+        # actual R1-R6 / pale-R7R8 / yellow-R7R8 populations per eye
+        # instead of one global brightness scalar.
+        for _cls, _lum in self.visual_afference.items():
+            if _lum <= 0.0:
+                continue
+            _mask = self.photoreceptor_masks[_cls]
+            _fires = _mask & (self.rng.random(self.n) < self.sensory_drive * self.R_POI * _lum * dt / 1000.0)
+            self.V[_fires] += self.W_SYN * self.F_POI
 
         # Neural Sandbox manual channel drive — independent of the camera
         # pathway above, additive continuous Poisson current per channel.
@@ -547,12 +888,75 @@ class BrainLIF:
         ppl_rate = union_spikes[self.is_ppl].mean() if self.is_ppl.any() else 0.0
         target = pam_rate - ppl_rate
         self.dopamine_rate += self.dopamine_rate_alpha * (target - self.dopamine_rate)
-        self.cumulative_reward += self.dopamine_rate * self.n_sub * self.sub_dt / 1000.0
+        # Per-compartment UNSIGNED dopamine level. The signed difference
+        # above is the right thing to REPORT as reward, but it is the wrong
+        # thing to learn from: PAM and PPL innervate different compartments,
+        # so each depresses its own synapses independently and they must not
+        # cancel. These two EMAs are the third factor actually used by the
+        # plasticity rule in _substep.
+        if self.dan_intent_left > 0:
+            self.dan_intent_left -= 1
+            if self.dan_intent_left == 0:
+                self.dan_intent = None
+        self.pam_level += self.dopamine_rate_alpha * (pam_rate - self.pam_level)
+        self.ppl_level += self.dopamine_rate_alpha * (ppl_rate - self.ppl_level)
+        # cumulative_reward integrates deviation-from-rest, not the raw
+        # signal — "reward" in the RL sense this dashboard is telling a
+        # story about means better-or-worse-than-doing-nothing, and the
+        # raw signal's resting value isn't zero (see dopamine_baseline
+        # above). Plasticity below still uses raw self.dopamine_rate
+        # unchanged — real biological weight updates aren't recentered.
+        self.cumulative_reward += (self.dopamine_rate - self.dopamine_baseline) * self.n_sub * self.sub_dt / 1000.0
+
+        # VNC efferent pathway: real vnc_motor L/R pooled firing rate (dn_rate
+        # is a whole-population EMA array despite its name — see __init__ —
+        # so indexing it with mn_left/mn_right reuses that same smoothing
+        # unchanged) through a SECOND, distinct low-pass stage modeling
+        # muscle calcium-activation dynamics (tau*da/dt = -a+u) — this is
+        # what set_forward_drive actually sends to the physics process, not
+        # the raw dn_rate readout.
+        mn_left_rate = self.dn_rate[self.mn_left].mean() if self.mn_left.any() else 0.0
+        mn_right_rate = self.dn_rate[self.mn_right].mean() if self.mn_right.any() else 0.0
+        self.muscle_activation_left += self.muscle_alpha * (mn_left_rate - self.muscle_activation_left)
+        self.muscle_activation_right += self.muscle_alpha * (mn_right_rate - self.muscle_activation_right)
 
         return self.spikes
 
+    def dn_readout(self) -> dict:
+        """Firing-rate readout of the efferent bottleneck: the broad
+        connectivity-derived premotor DN population (stable, 981 cells)
+        plus the individually-named literature locomotor DNs (DNb01/DNb02
+        forward, DNp09 stop — 2-4 cells each, high variance, reported for
+        observability only). dn_rate is the whole-network spike-rate EMA
+        (see step()), so these are all the same smoothed measure.
+
+        Values are returned in Hz. dn_rate itself is an EMA of a 0/1
+        per-outer-step spike indicator (i.e. spikes per step, ~0..1), so
+        dividing by the outer timestep converts it to spikes/second —
+        1/0.002s = a 500x factor here. Reporting the raw indicator as "Hz"
+        would understate the real firing rate by that same factor."""
+        to_hz = 1.0 / self.dt
+        out = {"premotor": float(self.dn_rate[self.dn_premotor].mean()) * to_hz if self.dn_premotor.any() else 0.0}
+        for name, mask in self.dn_named.items():
+            out[name] = float(self.dn_rate[mask].mean()) * to_hz if mask.any() else 0.0
+        return out
+
+    def motor_activation(self) -> tuple[float, float]:
+        """The VNC efferent readout physics_worker.py's CPG is actually
+        driven by — see the muscle-activation filter in step()."""
+        return float(self.muscle_activation_left), float(self.muscle_activation_right)
+
     def set_learning(self, enabled: bool):
         self.learning_enabled = bool(enabled)
+
+    def set_dan_clamp(self, enabled: bool):
+        """Enable/disable the SYNTHETIC winner-take-all clamp between the
+        PAM and PPL dopamine populations (see _substep). This is a
+        diagnostic override with no structural correlate in the connectome
+        — all 645 real PAM<->PPL synapses are excitatory. It exists so the
+        isolated three-factor STDP dynamics can be observed; it does not
+        make the model more biological."""
+        self.dan_clamp = bool(enabled)
 
     def weight_change_ratio(self) -> np.ndarray:
         """Per-plastic-synapse |current_weight| / |initial_weight| - 1, for
@@ -588,6 +992,18 @@ class BrainLIF:
         optic-lobe sensory neurons' Poisson rate directly (see _substep)."""
         self.visual_L = float(np.clip(left, 0.0, 1.0))
         self.visual_R = float(np.clip(right, 0.0, 1.0))
+
+    def set_visual_afference(self, broadband: tuple[float, float], pale: tuple[float, float],
+                              yellow: tuple[float, float]):
+        """Live compound-eye input from the real MuJoCo retina render, one
+        normalized luminance (0..1) per eye per photoreceptor class — see
+        photoreceptor_masks in __init__ for how each maps onto real
+        connectome populations. Each tuple is (left_eye, right_eye),
+        matching obs["vision"]'s (2, 721, 2) eye-major layout."""
+        v = self.visual_afference
+        v["broadband_L"], v["broadband_R"] = float(np.clip(broadband[0], 0, 1)), float(np.clip(broadband[1], 0, 1))
+        v["pale_L"], v["pale_R"] = float(np.clip(pale[0], 0, 1)), float(np.clip(pale[1], 0, 1))
+        v["yellow_L"], v["yellow_R"] = float(np.clip(yellow[0], 0, 1)), float(np.clip(yellow[1], 0, 1))
 
     def set_group_drive(self, name: str, rate: float):
         """Neural Sandbox: continuous manual drive on one real sensory
@@ -639,6 +1055,18 @@ class BrainLIF:
         if idx:
             self.V[idx] = self.V_TH + 1.0
             self.refrac_ms[idx] = 0.0  # make sure it isn't masked by a stale refractory window
+            # Latch which valence the user just injected, for the
+            # by-intention clamp (see _substep). Decided by which DAN
+            # population the injected set actually overlaps — no separate
+            # UI command needed, and it stays correct if the UI changes
+            # which neurons it samples.
+            sel = np.zeros(self.n, dtype=bool)
+            sel[idx] = True
+            n_pam = int((sel & self.is_pam).sum())
+            n_ppl = int((sel & self.is_ppl).sum())
+            if n_pam or n_ppl:
+                self.dan_intent = "PAM" if n_pam >= n_ppl else "PPL"
+                self.dan_intent_left = self.dan_intent_window
         return len(idx)
 
     def reset_state(self):
@@ -657,6 +1085,12 @@ class BrainLIF:
         # mushroom body has learned so far.
         self.eligibility[:] = 0.0
         self.dopamine_rate = 0.0
+        self.dan_intent = None
+        self.dan_intent_left = 0
+        self.pam_level = 0.0
+        self.ppl_level = 0.0
+        self.muscle_activation_left = 0.0
+        self.muscle_activation_right = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -674,6 +1108,10 @@ class BrainSnapshot:
     learning_enabled: bool = False
     dn_left_rate: float = 0.0
     dn_right_rate: float = 0.0
+    mn_activation_left: float = 0.0
+    mn_activation_right: float = 0.0
+    dn_premotor_rate: float = 0.0
+    dn_named_rates: dict = field(default_factory=dict)
 
 
 class VisionFlightBridge:
@@ -702,14 +1140,21 @@ class VisionFlightBridge:
     def step(self) -> BrainSnapshot:
         self.brain.step()
         thrust, yaw, dn_left_rate, dn_right_rate = self.brain.flight_command()
+        mn_activation_left, mn_activation_right = self.brain.motor_activation()
+        dn_rates = self.brain.dn_readout()
         self._t += self.brain_dt
         return BrainSnapshot(
             t=self._t, thrust=thrust, yaw_rate=yaw,
             spiking_ids=self.brain.spiking_body_ids(),
-            reward_signal=self.brain.dopamine_rate,
+            # Recentered on the resting baseline (see dopamine_baseline in
+            # BrainLIF.__init__) so the dashboard reports reward relative to
+            # doing-nothing, not the raw PAM-minus-PPL population fraction.
+            reward_signal=self.brain.dopamine_rate - self.brain.dopamine_baseline,
             cumulative_reward=self.brain.cumulative_reward,
             learning_enabled=self.brain.learning_enabled,
             dn_left_rate=dn_left_rate, dn_right_rate=dn_right_rate,
+            mn_activation_left=mn_activation_left, mn_activation_right=mn_activation_right,
+            dn_premotor_rate=dn_rates.pop("premotor"), dn_named_rates=dn_rates,
         )
 
 

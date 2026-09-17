@@ -21,10 +21,25 @@
 // objects directly; React state is reserved for things that actually
 // change rarely (connection status, pause, learning toggle, slider seeds).
 
-import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from 'react'
+import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef, Suspense, Component } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { Bounds, OrbitControls, PerformanceMonitor } from '@react-three/drei'
+import { Bounds, OrbitControls, PerformanceMonitor, Environment, Grid, useGLTF } from '@react-three/drei'
+import { EffectComposer, Bloom } from '@react-three/postprocessing'
 import * as THREE from 'three'
+
+// Environment/useGLTF are both async (HDRI fetch from a CDN, GLTF fetch
+// from /fly_rigged.glb) and a rejected load throws past Suspense — Suspense only
+// covers the *pending* state, not a 404 or network failure. This is the
+// minimum needed to catch that and degrade gracefully instead of taking
+// the whole canvas down with it.
+class RenderErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { failed: false } }
+  static getDerivedStateFromError() { return { failed: true } }
+  componentDidCatch(error) {
+    console.warn('[RenderErrorBoundary] falling back:', error?.message || error)
+  }
+  render() { return this.state.failed ? this.props.fallback : this.props.children }
+}
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 const WS_URL = API_BASE.replace(/^http/, 'ws') + '/ws'
@@ -83,42 +98,120 @@ function useBrainLayout(graph) {
   }, [graph])
 }
 
-const _obj3d = new THREE.Object3D()
-const _tmpColor = new THREE.Color()
+// Real neuPrint populations for the region-select UI (top pills + side
+// panel) — same match-function convention as SENSORY_CHANNELS/
+// RASTER_ROW_SPECS elsewhere in this file. 'all' has no match (shows real
+// per-class colors, no ghosting).
+const BRAIN_REGIONS = [
+  { key: 'all', label: 'Whole Brain', dotColor: '#4fa3ff', neon: null, match: null },
+  { key: 'OL', label: 'Optic Lobes', dotColor: '#00f3ff', neon: new THREE.Color('#00f3ff'), match: (n) => n.superclass === 'ol_sensory' },
+  { key: 'MB', label: 'Mushroom Body', dotColor: '#ff00ff', neon: new THREE.Color('#ff00ff'), match: (n) => n.class === 'Kenyon_Cell' || n.class === 'MBON' },
+  { key: 'DN', label: 'Descending Neurons', dotColor: '#ff6644', neon: new THREE.Color('#ff6644'), match: (n) => n.is_dn },
+]
+const GHOST_COLOR = new THREE.Color('#333333')
 
-function BrainInstances({ layout, spikeQueueRef, plasticWeightRef }) {
-  const meshRef = useRef()
-  const { positions, baseColors, idIndex, count } = layout
-  // Which instance indices are currently mid-flash (spiking or learning
-  // overlay) and need per-frame decay. At ~176k neurons, decaying (and
-  // re-uploading to the GPU) the *entire* instance-color buffer every
-  // single frame — most of which never changed — is the actual source of
-  // the main-thread/GPU freeze: this tracks only the handful of neurons
-  // actually mid-transition, so an idle frame with no new spikes costs
-  // ~0, not O(count).
-  const activeRef = useRef(new Set())
-
-  useEffect(() => {
-    const mesh = meshRef.current
-    if (!mesh) return
-    for (let i = 0; i < count; i++) {
-      _obj3d.position.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2])
-      _obj3d.updateMatrix()
-      mesh.setMatrixAt(i, _obj3d.matrix)
-      _tmpColor.setRGB(baseColors[i * 3], baseColors[i * 3 + 1], baseColors[i * 3 + 2])
-      mesh.setColorAt(i, _tmpColor)
+// Per-region real body-id membership (not indices — indices depend on
+// `layout`, ids don't) plus the live spike-count set the side panel reads
+// directly off the WS payload.
+function useBrainRegionIds(graph) {
+  return useMemo(() => {
+    const out = {}
+    for (const r of BRAIN_REGIONS) {
+      if (!r.match) { out[r.key] = null; continue }
+      const ids = new Set()
+      for (const n of graph.nodes) if (r.match(n)) ids.add(n.id)
+      out[r.key] = ids
     }
-    mesh.instanceMatrix.needsUpdate = true
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
-    mesh.matrixAutoUpdate = false
-    mesh.updateMatrix()
+    return out
+  }, [graph])
+}
+
+function useBrainRegionIndexSets(layout, regionIds) {
+  return useMemo(() => {
+    const out = {}
+    for (const key in regionIds) {
+      const ids = regionIds[key]
+      if (!ids) { out[key] = null; continue }
+      const idxSet = new Set()
+      for (const id of ids) {
+        const idx = layout.idIndex.get(id)
+        if (idx !== undefined) idxSet.add(idx)
+      }
+      out[key] = idxSet
+    }
+    return out
+  }, [layout, regionIds])
+}
+
+// Ghost-vs-highlight is baked directly into the vertex RGB (dark grey vs.
+// full-brightness neon), not material opacity — alpha-blending a "ghost"
+// layer over #000 would also dim the highlighted neon points sitting in
+// the SAME buffer/material, undermining the exact glow effect this is for
+// (see the earlier BrainInstances fix: transparent opacity was why the
+// brain read as empty in the first place). 'all' shows real per-class
+// colors from layout.baseColors, no ghosting.
+function paintRegionColors(target, layout, regionIndexSets, selectedKey) {
+  const { baseColors, count } = layout
+  if (selectedKey === 'all' || !regionIndexSets[selectedKey]) {
+    target.set(baseColors)
+    return
+  }
+  const region = BRAIN_REGIONS.find((r) => r.key === selectedKey)
+  const selected = regionIndexSets[selectedKey]
+  for (let i = 0; i < count; i++) {
+    const b = i * 3
+    if (selected.has(i)) {
+      target[b] = region.neon.r; target[b + 1] = region.neon.g; target[b + 2] = region.neon.b
+    } else {
+      target[b] = GHOST_COLOR.r; target[b + 1] = GHOST_COLOR.g; target[b + 2] = GHOST_COLOR.b
+    }
+  }
+}
+
+// THREE.Points instead of InstancedMesh<icosahedron>: one draw call, no
+// per-instance triangle geometry — a real, large GPU-cost reduction at
+// ~176k neurons, not a cosmetic swap. Same active-set/decay flash
+// technique as before, just writing into a BufferGeometry color attribute
+// instead of instanceColor.
+function BrainPointCloud({ layout, regionIndexSets, selectedRegion, spikeQueueRef, plasticWeightRef }) {
+  const geomRef = useRef()
+  const restColorsRef = useRef(null)
+  const colorsRef = useRef(null)
+  const activeRef = useRef(new Set())
+  const { positions, idIndex, count } = layout
+
+  // Full re-init when the dataset itself changes (effectively once).
+  useEffect(() => {
+    const rest = new Float32Array(count * 3)
+    paintRegionColors(rest, layout, regionIndexSets, selectedRegion)
+    restColorsRef.current = rest
+    colorsRef.current = new Float32Array(rest)
     activeRef.current.clear()
-  }, [positions, baseColors, count])
+
+    const geom = geomRef.current
+    if (!geom) return
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geom.setAttribute('color', new THREE.BufferAttribute(colorsRef.current, 3))
+    geom.computeBoundingSphere()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout])
+
+  // Region toggle: ghost/highlight is a real-time state switch, not
+  // something that should slowly fade in — snap immediately.
+  useEffect(() => {
+    if (!restColorsRef.current || !colorsRef.current) return
+    paintRegionColors(restColorsRef.current, layout, regionIndexSets, selectedRegion)
+    colorsRef.current.set(restColorsRef.current)
+    activeRef.current.clear()
+    const geom = geomRef.current
+    if (geom && geom.attributes.color) geom.attributes.color.needsUpdate = true
+  }, [selectedRegion, regionIndexSets, layout])
 
   useFrame(() => {
-    const mesh = meshRef.current
-    if (!mesh || !mesh.instanceColor) return
-    const colors = mesh.instanceColor.array
+    const geom = geomRef.current
+    if (!geom || !geom.attributes.color) return
+    const colors = colorsRef.current
+    const rest = restColorsRef.current
     const active = activeRef.current
     let changed = false
 
@@ -128,7 +221,7 @@ function BrainInstances({ layout, spikeQueueRef, plasticWeightRef }) {
         const idx = idIndex.get(bodyId)
         if (idx === undefined) continue
         const b = idx * 3
-        colors[b + 0] = SPIKE_COLOR.r; colors[b + 1] = SPIKE_COLOR.g; colors[b + 2] = SPIKE_COLOR.b
+        colors[b] = SPIKE_COLOR.r; colors[b + 1] = SPIKE_COLOR.g; colors[b + 2] = SPIKE_COLOR.b
         active.add(idx)
       }
       spikeQueueRef.current = null
@@ -140,9 +233,9 @@ function BrainInstances({ layout, spikeQueueRef, plasticWeightRef }) {
         const b = idx * 3
         let settled = true
         for (let k = 0; k < 3; k++) {
-          const base = baseColors[b + k]
+          const base = rest[b + k]
           const next = base + (colors[b + k] - base) * COLOR_DECAY
-          if (Math.abs(next - base) > 0.004) settled = false
+          if (Math.abs(next - base) > 0.01) settled = false
           colors[b + k] = settled ? base : next
         }
         if (settled) active.delete(idx)
@@ -158,137 +251,192 @@ function BrainInstances({ layout, spikeQueueRef, plasticWeightRef }) {
         const amount = Math.min(1, weights[key] * 2)
         if (amount <= 0.02) continue
         const b = idx * 3
-        colors[b + 0] = colors[b + 0] + (LEARN_COLOR.r - colors[b + 0]) * amount
-        colors[b + 1] = colors[b + 1] + (LEARN_COLOR.g - colors[b + 1]) * amount
-        colors[b + 2] = colors[b + 2] + (LEARN_COLOR.b - colors[b + 2]) * amount
-        active.add(idx) // keep it decaying back toward base afterward too
+        colors[b] += (LEARN_COLOR.r - colors[b]) * amount
+        colors[b + 1] += (LEARN_COLOR.g - colors[b + 1]) * amount
+        colors[b + 2] += (LEARN_COLOR.b - colors[b + 2]) * amount
+        active.add(idx)
       }
       changed = true
     }
 
-    if (changed) mesh.instanceColor.needsUpdate = true
+    if (changed) geom.attributes.color.needsUpdate = true
   })
 
   return (
-    <instancedMesh ref={meshRef} args={[null, null, count]}>
-      {/* subdivision 0 (20 tris) instead of 1 (80 tris) — invisible at this
-          radius, 4x fewer triangles across ~176k instances. Opaque instead
-          of transparent: alpha-blending against #000 was dimming every
-          color toward black, which is why the brain read as "empty". */}
-      <icosahedronGeometry args={[0.06, 0]} />
-      <meshBasicMaterial vertexColors toneMapped={false} />
-    </instancedMesh>
+    <points frustumCulled={false}>
+      <bufferGeometry ref={geomRef} />
+      <pointsMaterial vertexColors size={0.045} sizeAttenuation toneMapped={false} />
+    </points>
   )
 }
 
-function useSegmentBuffer(url) {
-  const [positions, setPositions] = useState(null)
+// ---------------------------------------------------------------------
+// Module 2 alternate view: real 2D projection of the actual dataset — same
+// `layout` (real soma positions + real per-class colors) and the same
+// spikeQueueRef/plasticWeightRef BrainPointCloud (the 3D view) reads, just
+// flattened onto a raw 2D <canvas> instead of WebGL. Not a stylized
+// diagram: every point is a real neuron at its real (x, y) position (the
+// same two axes the 3D view's default camera looks along, so this reads as
+// "the same brain, flattened" rather than a different layout). Cheap
+// because the ~176k static points are rasterized ONCE to an offscreen
+// canvas and blitted every frame (a single drawImage call); only the
+// bounded set of currently-flashing neurons is redrawn per frame, same
+// active-set/decay technique as BrainPointCloud above.
+// ---------------------------------------------------------------------
+
+function Brain2DMap({ layout, spikeQueueRef, plasticWeightRef }) {
+  const canvasRef = useRef()
+  const containerRef = useRef()
+  const baseRef = useRef(null)     // offscreen canvas: all neurons, resting colors
+  const screenRef = useRef(null)   // Float32Array of precomputed [sx0,sy0,sx1,sy1,...]
+  const colorStateRef = useRef(null) // Float32Array [r,g,b,...] current display color per neuron
+  const activeRef = useRef(new Set())
+
+  // Project real soma (x, y) -> screen space once per layout/resize, and
+  // rasterize the static base layer once — this is the only O(count) work,
+  // done outside the render loop.
   useEffect(() => {
-    let cancelled = false
-    fetch(url)
-      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
-      .then((buf) => { if (!cancelled) setPositions(new Float32Array(buf)) })
-      .catch(() => setPositions(null))
-    return () => { cancelled = true }
-  }, [url])
-  return positions
-}
+    const canvas = canvasRef.current
+    const container = containerRef.current
+    if (!canvas || !container) return
 
-const _p0 = new THREE.Vector3()
-const _p1 = new THREE.Vector3()
-const _dir = new THREE.Vector3()
-const _mid = new THREE.Vector3()
-const _quat = new THREE.Quaternion()
-const _up = new THREE.Vector3(0, 1, 0)
-const _fiberObj = new THREE.Object3D()
-const FIBER_COLOR = new THREE.Color('#4fd0ff')       // neon blue — central tracts (DN output fibers)
-const OPTIC_FIBER_COLOR = new THREE.Color('#22e07a')  // deep neon green — optic-lobe visual pathway
+    const { positions, baseColors, count } = layout
+    const screen = new Float32Array(count * 2)
+    screenRef.current = screen
+    const colorState = new Float32Array(baseColors) // start at resting colors
+    colorStateRef.current = colorState
+    activeRef.current.clear()
 
-function TubeFibers({ positions, radius = 0.015, color = FIBER_COLOR }) {
-  const meshRef = useRef()
-  const count = positions ? Math.floor(positions.length / 6) : 0
+    const rebuild = () => {
+      const w = container.clientWidth, h = container.clientHeight
+      canvas.width = w
+      canvas.height = h
+      if (!w || !h || count === 0) return
 
-  useEffect(() => {
-    const mesh = meshRef.current
-    if (!mesh || !positions || count === 0) return
-    for (let i = 0; i < count; i++) {
-      const b = i * 6
-      _p0.set(positions[b + 0], positions[b + 1], positions[b + 2])
-      _p1.set(positions[b + 3], positions[b + 4], positions[b + 5])
-      _dir.subVectors(_p1, _p0)
-      const len = _dir.length()
-      if (len < 1e-6) {
-        _fiberObj.scale.set(0, 0, 0); _fiberObj.updateMatrix(); mesh.setMatrixAt(i, _fiberObj.matrix)
-        continue
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      for (let i = 0; i < count; i++) {
+        const x = positions[i * 3], y = positions[i * 3 + 1]
+        if (x < minX) minX = x; if (x > maxX) maxX = x
+        if (y < minY) minY = y; if (y > maxY) maxY = y
       }
-      _dir.normalize()
-      _mid.addVectors(_p0, _p1).multiplyScalar(0.5)
-      _quat.setFromUnitVectors(_up, _dir)
-      _fiberObj.position.copy(_mid)
-      _fiberObj.quaternion.copy(_quat)
-      _fiberObj.scale.set(radius, len, radius)
-      _fiberObj.updateMatrix()
-      mesh.setMatrixAt(i, _fiberObj.matrix)
+      const pad = 0.92 // fraction of canvas used, leaving a margin
+      const spanX = (maxX - minX) || 1, spanY = (maxY - minY) || 1
+      const scale = Math.min((w * pad) / spanX, (h * pad) / spanY)
+      const midX = (minX + maxX) / 2, midY = (minY + maxY) / 2
+      for (let i = 0; i < count; i++) {
+        screen[i * 2] = (positions[i * 3] - midX) * scale + w / 2
+        // canvas y grows downward — flip so "up" in world space is up on screen
+        screen[i * 2 + 1] = -(positions[i * 3 + 1] - midY) * scale + h / 2
+      }
+
+      const off = document.createElement('canvas')
+      off.width = w; off.height = h
+      const octx = off.getContext('2d')
+      octx.fillStyle = '#050505'
+      octx.fillRect(0, 0, w, h)
+      octx.globalAlpha = 0.6
+      for (let i = 0; i < count; i++) {
+        octx.fillStyle = `rgb(${(baseColors[i * 3] * 255) | 0}, ${(baseColors[i * 3 + 1] * 255) | 0}, ${(baseColors[i * 3 + 2] * 255) | 0})`
+        octx.fillRect(screen[i * 2], screen[i * 2 + 1], 1.3, 1.3)
+      }
+      octx.globalAlpha = 1
+      baseRef.current = off
     }
-    mesh.instanceMatrix.needsUpdate = true
-    mesh.computeBoundingSphere()
-    mesh.matrixAutoUpdate = false
-    mesh.updateMatrix()
-  }, [positions, count, radius])
 
-  if (!positions || count === 0) return null
+    rebuild()
+    const ro = new ResizeObserver(rebuild)
+    ro.observe(container)
+    return () => ro.disconnect()
+  }, [layout])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    let raf
+    const ctx = canvas.getContext('2d')
+    const { idIndex, baseColors, count } = layout
+
+    const draw = () => {
+      raf = requestAnimationFrame(draw)
+      const base = baseRef.current
+      const screen = screenRef.current
+      const colors = colorStateRef.current
+      if (!base || !screen || !colors) return
+      ctx.drawImage(base, 0, 0)
+
+      const active = activeRef.current
+      const spiking = spikeQueueRef.current
+      if (spiking && spiking.length) {
+        for (const bodyId of spiking) {
+          const idx = idIndex.get(bodyId)
+          if (idx === undefined) continue
+          const b = idx * 3
+          colors[b] = SPIKE_COLOR.r; colors[b + 1] = SPIKE_COLOR.g; colors[b + 2] = SPIKE_COLOR.b
+          active.add(idx)
+        }
+        spikeQueueRef.current = null
+      }
+
+      const weights = plasticWeightRef && plasticWeightRef.current
+      if (weights) {
+        for (const key in weights) {
+          const idx = idIndex.get(Number(key))
+          if (idx === undefined || idx >= count) continue
+          const amount = Math.min(1, weights[key] * 2)
+          if (amount <= 0.02) continue
+          const b = idx * 3
+          colors[b] += (LEARN_COLOR.r - colors[b]) * amount
+          colors[b + 1] += (LEARN_COLOR.g - colors[b + 1]) * amount
+          colors[b + 2] += (LEARN_COLOR.b - colors[b + 2]) * amount
+          active.add(idx)
+        }
+      }
+
+      // Same bounded active-set decay as BrainPointCloud — only currently
+      // mid-flash neurons get touched/redrawn, not all ~176k every frame.
+      for (const idx of active) {
+        const b = idx * 3
+        let settled = true
+        for (let k = 0; k < 3; k++) {
+          const base_ = baseColors[b + k]
+          const next = base_ + (colors[b + k] - base_) * COLOR_DECAY
+          if (Math.abs(next - base_) > 0.01) settled = false
+          colors[b + k] = settled ? base_ : next
+        }
+        const r = (colors[b] * 255) | 0, g = (colors[b + 1] * 255) | 0, bch = (colors[b + 2] * 255) | 0
+        ctx.fillStyle = `rgb(${r}, ${g}, ${bch})`
+        const sx = screen[idx * 2], sy = screen[idx * 2 + 1]
+        ctx.fillRect(sx - 1, sy - 1, 3, 3)
+        if (settled) active.delete(idx)
+      }
+    }
+    draw()
+    return () => cancelAnimationFrame(raf)
+  }, [layout, spikeQueueRef, plasticWeightRef])
+
   return (
-    <instancedMesh ref={meshRef} args={[null, null, count]} frustumCulled>
-      <cylinderGeometry args={[1, 1, 1, 5, 1, false]} />
-      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={0.8} blending={THREE.AdditiveBlending} />
-    </instancedMesh>
+    <div ref={containerRef} className="module-canvas-wrap">
+      <canvas ref={canvasRef} />
+    </div>
   )
 }
 
-function useSkeletonLOD(fineUrl, coarseUrl) {
-  const finePositions = useSegmentBuffer(fineUrl)
-  const coarsePositions = useSegmentBuffer(coarseUrl)
-  const { camera } = useThree()
-  const [level, setLevel] = useState('coarse')
-  const frameRef = useRef(0)
-
-  useFrame(() => {
-    frameRef.current += 1
-    if (frameRef.current % 10 !== 0) return
-    if (!finePositions || !coarsePositions) return
-    const dist = camera.position.length()
-    const want = dist < 8 ? 'fine' : 'coarse'
-    if (want !== level) setLevel(want)
-  })
-
-  return (level === 'fine' ? finePositions : coarsePositions) || coarsePositions || finePositions
-}
-
-function SkeletonFibers() {
-  const dnPositions = useSkeletonLOD(
-    API_BASE + '/static/dn_skeleton_segments.bin',
-    API_BASE + '/static/dn_skeleton_segments_coarse.bin',
-  )
-  const opticPositions = useSkeletonLOD(
-    API_BASE + '/static/optic_skeleton_segments.bin',
-    API_BASE + '/static/optic_skeleton_segments_coarse.bin',
-  )
-  return (
-    <>
-      <TubeFibers positions={dnPositions} color={FIBER_COLOR} />
-      <TubeFibers positions={opticPositions} color={OPTIC_FIBER_COLOR} />
-    </>
-  )
-}
-
-function BrainScene({ layout, spikeQueueRef, plasticWeightRef, onDeclinePerf, onInclinePerf }) {
+function BrainScene({ layout, regionIndexSets, selectedRegion, spikeQueueRef, plasticWeightRef, onDeclinePerf, onInclinePerf }) {
   return (
     <>
       <color attach="background" args={['#000000']} />
-      <ambientLight intensity={0.6} />
-      <Bounds fit clip observe margin={1.35}>
-        <SkeletonFibers />
-        <BrainInstances layout={layout} spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef} />
+      {/* `observe` used to re-fit the camera any time the wrapped content's
+          bounding box changed — which fought the user's own zoom/pan
+          continuously and could spiral into "shrinks until it disappears".
+          `key={selectedRegion}` remounts Bounds (one deliberate re-fit) only
+          on an actual user action — switching region pills — never on its
+          own; after that, OrbitControls below is the sole thing that moves
+          this camera. */}
+      <Bounds key={selectedRegion} fit clip margin={1.35}>
+        <BrainPointCloud
+          layout={layout} regionIndexSets={regionIndexSets} selectedRegion={selectedRegion}
+          spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef}
+        />
       </Bounds>
       {/* demand frameloop + OrbitControls: drei invalidates automatically
           on drag/zoom/damping, no extra wiring needed for the interaction
@@ -296,151 +444,105 @@ function BrainScene({ layout, spikeQueueRef, plasticWeightRef, onDeclinePerf, on
           invalidate() (wired from Dashboard via Canvas's onCreated). */}
       <OrbitControls enableDamping dampingFactor={0.08} rotateSpeed={0.5} makeDefault />
       <PerformanceMonitor onDecline={onDeclinePerf} onIncline={onInclinePerf} />
+      {/* Bloom on the neon-vs-ghost point cloud: the "hologram" look
+          Bloom needs comes purely from luminance contrast (bright neon
+          points vs. dark grey ghost points), which the vertex colors above
+          already provide — no emissive materials required for Points.
+          Wrapped in the same error boundary used for Environment/GltfFlyModel
+          elsewhere — postprocessing setup failing shouldn't be able to take
+          the rest of the scene (and every useFrame in it) down with it. */}
+      <RenderErrorBoundary fallback={null}>
+        <EffectComposer>
+          <Bloom height={300} luminanceThreshold={0.5} luminanceSmoothing={0.9} intensity={1.2} mipmapBlur />
+        </EffectComposer>
+      </RenderErrorBoundary>
     </>
   )
 }
 
 // ---------------------------------------------------------------------
-// Module 1: Optic Flow Tunnel — cheap procedural closed-loop VR corridor.
-// The camera IS the fly: DN thrust/yaw_rate (already broadcast by the
-// backend every tick) drive it directly. Wall proximity per side feeds
-// straight back into the connectome's real ol_sensory input, and
-// wall contact / sustained clean flight fire the same real PPL/PAM DAN
-// populations the manual mushroom-body panel drives — this is the
-// STDP reward engine's actual signal source.
+// Module 1: passive telemetry observer for a LIVE flygym/MuJoCo body
+// simulation running in its own OS process on the backend (see
+// physics_worker.py — a separate multiprocessing.Process, not a thread:
+// `import flygym` on any background thread of the server process
+// reproducibly hung it on this Mac with an AppKit assertion failure,
+// confirmed with a minimal repro in this project's history; a real OS
+// process gets its own main thread, which sidesteps that). MuJoCo's own
+// per-step cost benchmarked at 0.03x real-time (biomechanics_env.py), so
+// telemetry_server.py's broadcaster repeats the last computed pose across
+// ticks whenever the physics process hasn't finished its next ~3.9ms step
+// yet — this component does ZERO physics, ZERO accumulation, and ZERO
+// interpolation: whatever fly_pos/fly_quat arrived on the WebSocket is
+// applied directly, instantly, every time. If the backend takes several
+// seconds between updates, the model sits still for several seconds. That
+// "strobe" behavior is the real, honest computation rate, not smoothed
+// over — this was an explicit, deliberate design decision.
+//
+// What this cost: there's no more tunnel/walls, so the wall-proximity
+// sensory hook and the collision/reward hooks the earlier Optic Flow
+// Tunnel used no longer have anything to measure against. Automatic
+// visual_input sends are dropped entirely (manual sensory injection via
+// SensoryPanel is unaffected), and no automatic PPL/PAM reward hook lives
+// here anymore either — there's no client-side "thrust timer" left to
+// drive one now that the walk is computed entirely server-side. Manual
+// PPL/PAM buttons in ControlPanel are unaffected.
 // ---------------------------------------------------------------------
 
-const TUNNEL_RADIUS = 2.2
-const TUNNEL_MARGIN = 0.35         // fly's effective half-width for collision
-const RING_SPACING = 1.4
-const N_RINGS = 40
-const BARS_PER_RING = 14
-const TUNNEL_LENGTH = RING_SPACING * N_RINGS
-const BASE_FORWARD_SPEED = 3.0     // world units/sec at thrust=0 (idle drift)
-const THRUST_FORWARD_GAIN = 6.0    // extra world units/sec at thrust=1
-const LATERAL_GAIN = 2.2           // yaw_rate -> lateral velocity
-const LATERAL_DAMPING = 2.5        // /sec, pulls lateral velocity toward 0
-const COLLISION_BOUNCE = -0.4
-const COLLISION_COOLDOWN = 0.35    // sec between aversive spikes
-const REWARD_INTERVAL = 0.6        // sec between appetitive spikes while clean
-
-const _barObj = new THREE.Object3D()
-const BAR_COLOR_A = new THREE.Color('#ffffff')
-const BAR_COLOR_B = new THREE.Color('#0a0a0a')
-
-function TunnelPillars({ scrollRef }) {
-  const meshRef = useRef()
-  const count = N_RINGS * BARS_PER_RING
-
-  useFrame(() => {
-    const mesh = meshRef.current
-    if (!mesh) return
-    const scroll = scrollRef.current
-    let i = 0
-    for (let r = 0; r < N_RINGS; r++) {
-      let z = scroll - r * RING_SPACING
-      // Recycle rings that pass behind the camera (z > 0) back out to the
-      // far end, keeping every ring's z in (-TUNNEL_LENGTH, 0]. (JS `%`
-      // keeps the sign of the dividend, so for a small negative z this is
-      // already a no-op — the previous +TUNNEL_LENGTH/%TUNNEL_LENGTH/negate
-      // version instead pushed every ring but r=0 straight out past the
-      // fog cutoff every frame, which is why the tunnel rendered empty.)
-      z %= TUNNEL_LENGTH
-      if (z > 0) z -= TUNNEL_LENGTH
-      const parity = r % 2 === 0
-      for (let b = 0; b < BARS_PER_RING; b++) {
-        const angle = (b / BARS_PER_RING) * Math.PI * 2
-        const x = Math.cos(angle) * TUNNEL_RADIUS
-        const y = Math.sin(angle) * TUNNEL_RADIUS
-        // Bars stay aligned to global up (no per-bar rotation) so they read
-        // as true vertical stripes, matching the classic optic-flow-drum
-        // stimulus rather than tilted "petals".
-        _barObj.position.set(x, y, z)
-        _barObj.rotation.set(0, 0, 0)
-        _barObj.scale.set(1, 1, 1)
-        _barObj.updateMatrix()
-        mesh.setMatrixAt(i, _barObj.matrix)
-        mesh.setColorAt(i, parity ? BAR_COLOR_A : BAR_COLOR_B)
-        i++
-      }
-    }
-    mesh.instanceMatrix.needsUpdate = true
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
-  })
-
-  return (
-    <instancedMesh ref={meshRef} args={[null, null, count]} frustumCulled={false}>
-      <boxGeometry args={[0.16, 0.9, 0.16]} />
-      <meshBasicMaterial vertexColors toneMapped={false} />
-    </instancedMesh>
+// flygym/MuJoCo's world is Z-up, +X-forward; this file's three.js scene
+// (every other module) is Y-up, -Z-forward. The intended mapping is
+// three_x=-mj_y, three_y=mj_z, three_z=-mj_x — a genuine proper rotation
+// (determinant +1, verified by hand) between those two right-handed
+// frames, verified against a real fly_pos sample: mj=[28.15,0.085,0.93]
+// (walked ~28 units forward, z=0.93 up) must land at three_y=+0.93 (up)
+// and three_z=-28.15 (matching this file's own -Z-forward convention).
+//
+// THREE.Matrix4.makeBasis(xAxis,yAxis,zAxis) sets those vectors as the
+// resulting matrix's COLUMNS, i.e. row i of the matrix is
+// (xAxis[i], yAxis[i], zAxis[i]) — NOT its rows. An earlier version of
+// this constant passed (0,-1,0),(0,0,1),(-1,0,0) as if makeBasis took
+// per-axis ROWS (matching "three_x=-mj_y" read directly as a row), which
+// actually built the TRANSPOSE of the intended matrix — silently mapping
+// mj's forward-walk distance onto three.js's Y (vertical) axis instead of
+// Z, sending the fly straight down through the floor as soon as it moved,
+// rather than walking across it. Confirmed by running the literal
+// three.js library on that sample (not just worked out by hand): the old
+// arguments produced [-0.93,-28.15,0.085]; these produce the correct
+// [-0.085,+0.93,-28.15]. The vectors below are that matrix's actual
+// COLUMNS (i.e. the transpose of the naive per-axis-row reading above).
+const MJ_TO_THREE = new THREE.Quaternion().setFromRotationMatrix(
+  new THREE.Matrix4().makeBasis(
+    new THREE.Vector3(0, 0, -1),
+    new THREE.Vector3(-1, 0, 0),
+    new THREE.Vector3(0, 1, 0),
   )
-}
+)
+// Precomputed once — see the aliasing note in FlyBodyAvatar for why this
+// must NOT be derived inline from MJ_TO_THREE at use time.
+const MJ_TO_THREE_INV = MJ_TO_THREE.clone().invert()
 
-function TunnelRig({ flightCmdRef, telemetryRef, sendCmd, pplIds, pamIds }) {
-  const scrollRef = useRef(0)
-  const lateralRef = useRef(0)
-  const lateralVelRef = useRef(0)
-  const cooldownRef = useRef(0)
-  const cleanTimerRef = useRef(0)
-  const sendThrottleRef = useRef(0)
+// Real per-joint angle order — copied verbatim from a live
+// flygym.Fly().actuated_joints (see build_fly_anatomical_mesh.py),
+// matching fly_rigged.glb's node names AND obs["joints"][0]'s column
+// order exactly. That column-order match isn't assumed: verified directly
+// by forcing a single joint's target to 1.0 mid-sim and confirming the
+// response landed at exactly that name's index in this same list.
+const ACTUATED_JOINT_NAMES = [
+  'joint_LFCoxa', 'joint_LFCoxa_roll', 'joint_LFCoxa_yaw', 'joint_LFFemur', 'joint_LFFemur_roll', 'joint_LFTibia', 'joint_LFTarsus1',
+  'joint_LMCoxa', 'joint_LMCoxa_roll', 'joint_LMCoxa_yaw', 'joint_LMFemur', 'joint_LMFemur_roll', 'joint_LMTibia', 'joint_LMTarsus1',
+  'joint_LHCoxa', 'joint_LHCoxa_roll', 'joint_LHCoxa_yaw', 'joint_LHFemur', 'joint_LHFemur_roll', 'joint_LHTibia', 'joint_LHTarsus1',
+  'joint_RFCoxa', 'joint_RFCoxa_roll', 'joint_RFCoxa_yaw', 'joint_RFFemur', 'joint_RFFemur_roll', 'joint_RFTibia', 'joint_RFTarsus1',
+  'joint_RMCoxa', 'joint_RMCoxa_roll', 'joint_RMCoxa_yaw', 'joint_RMFemur', 'joint_RMFemur_roll', 'joint_RMTibia', 'joint_RMTarsus1',
+  'joint_RHCoxa', 'joint_RHCoxa_roll', 'joint_RHCoxa_yaw', 'joint_RHFemur', 'joint_RHFemur_roll', 'joint_RHTibia', 'joint_RHTarsus1',
+]
 
-  useFrame(({ camera }, delta) => {
-    const dt = Math.min(delta, 0.05)
-    const cmd = flightCmdRef.current
-
-    scrollRef.current += (BASE_FORWARD_SPEED + THRUST_FORWARD_GAIN * Math.max(0, cmd.thrust)) * dt
-
-    lateralVelRef.current += cmd.yaw_rate * LATERAL_GAIN * dt
-    lateralVelRef.current -= lateralVelRef.current * Math.min(1, LATERAL_DAMPING * dt)
-    lateralRef.current += lateralVelRef.current * dt
-
-    const limit = TUNNEL_RADIUS - TUNNEL_MARGIN
-    let collided = false
-    if (lateralRef.current > limit) {
-      lateralRef.current = limit; lateralVelRef.current *= COLLISION_BOUNCE; collided = true
-    } else if (lateralRef.current < -limit) {
-      lateralRef.current = -limit; lateralVelRef.current *= COLLISION_BOUNCE; collided = true
-    }
-
-    camera.position.x = lateralRef.current
-    camera.position.y = 0
-    camera.rotation.z = THREE.MathUtils.clamp(-cmd.yaw_rate * 0.15, -0.4, 0.4)
-
-    // Sensory hook: proximity to each wall -> real ol_sensory brightness.
-    const proxRight = Math.max(0, lateralRef.current / limit)
-    const proxLeft = Math.max(0, -lateralRef.current / limit)
-    telemetryRef.current.proxLeft = proxLeft
-    telemetryRef.current.proxRight = proxRight
-    telemetryRef.current.collided = collided
-
-    sendThrottleRef.current += dt
-    if (sendThrottleRef.current >= 1 / 20) {
-      sendThrottleRef.current = 0
-      sendCmd({ cmd: 'visual_input', left: 0.25 + proxLeft * 0.75, right: 0.25 + proxRight * 0.75 })
-    }
-
-    // STDP reward engine: real PPL (aversive) on collision, real PAM
-    // (appetitive) on sustained clean forward flight.
-    cooldownRef.current = Math.max(0, cooldownRef.current - dt)
-    if (collided) {
-      cleanTimerRef.current = 0
-      telemetryRef.current.collisionCount += 1
-      if (cooldownRef.current <= 0 && pplIds.length) {
-        cooldownRef.current = COLLISION_COOLDOWN
-        sendCmd({ cmd: 'inject_spike', body_ids: pplIds })
-      }
-    } else if (cmd.thrust > 0.15) {
-      cleanTimerRef.current += dt
-      if (cleanTimerRef.current >= REWARD_INTERVAL && pamIds.length) {
-        cleanTimerRef.current = 0
-        sendCmd({ cmd: 'inject_spike', body_ids: samplePlain(pamIds, 40) })
-      }
-    } else {
-      cleanTimerRef.current = 0
-    }
-  })
-
-  return <TunnelPillars scrollRef={scrollRef} />
+// Every flygym leg joint's rotation axis is a plain local unit vector
+// determined purely by its name suffix — checked against all 42 real
+// joints directly (not assumed from one leg's example): "_yaw"->X,
+// "_roll"->Z, everything else (each segment's own hinge)->Y.
+function jointAxisProp(name) {
+  if (name.endsWith('_yaw')) return 'x'
+  if (name.endsWith('_roll')) return 'z'
+  return 'y'
 }
 
 function samplePlain(ids, n) {
@@ -454,15 +556,296 @@ function samplePlain(ids, n) {
   return out
 }
 
-function TunnelScene({ flightCmdRef, telemetryRef, sendCmd, pplIds, pamIds, onDeclinePerf, onInclinePerf }) {
+// A real (if procedural) wing outline via quadratic Bezier curves, built
+// once and shared by both wings (mirrored via negative X scale). Longer/
+// wider than the first pass, extending back over the abdomen at rest —
+// closer to real fly wing proportions than the earlier stubby version.
+function useWingGeometry() {
+  return useMemo(() => {
+    const shape = new THREE.Shape()
+    shape.moveTo(0, 0)
+    shape.quadraticCurveTo(0.13, 0.11, 0.42, 0.15)
+    shape.quadraticCurveTo(0.7, 0.18, 0.66, 0.03)
+    shape.quadraticCurveTo(0.63, -0.09, 0.37, -0.06)
+    shape.quadraticCurveTo(0.13, -0.04, 0, 0)
+    return new THREE.ShapeGeometry(shape)
+  }, [])
+}
+
+// Six legs, three bilateral pairs (fore/mid/hind), each just a thin
+// cylinder angled out and down from the thorax — the single biggest
+// silhouette cue that was missing before (a body with no legs doesn't
+// read as an insect no matter how good the body itself looks).
+const LEG_PAIRS = [
+  { z: 0.09, splay: 0.55, rake: 0.35 },  // fore — angled forward
+  { z: -0.01, splay: 0.85, rake: 0 },    // mid — straight out
+  { z: -0.11, splay: 0.6, rake: -0.45 }, // hind — angled back
+]
+const LEG_COLOR = '#111114'
+
+// Polished PBR fallback — capsules instead of a sphere+cone (smoother,
+// more organic silhouette than the original primitives), bigger
+// compound eyes (the single most recognizable fly feature), abdomen
+// segmentation rings, and legs. Lit (MeshStandardMaterial, dark metallic)
+// so it reacts to the studio lights/HDRI in TunnelScene. Used whenever
+// /fly_rigged.glb fails to load — see RiggedFlyModel/RenderErrorBoundary
+// below.
+function ProceduralFlyFallback({ thrustRef }) {
+  const leftWingRef = useRef()
+  const rightWingRef = useRef()
+  const wingGeo = useWingGeometry()
+
+  useFrame(() => {
+    const flap = Math.sin(performance.now() * 0.025) * (0.15 + thrustRef.current * 0.3)
+    if (leftWingRef.current) leftWingRef.current.rotation.z = 0.25 + flap
+    if (rightWingRef.current) rightWingRef.current.rotation.z = -0.25 - flap
+  })
+
   return (
     <>
-      <color attach="background" args={['#000000']} />
-      <fog attach="fog" args={['#000000', 4, 14]} />
-      <TunnelRig flightCmdRef={flightCmdRef} telemetryRef={telemetryRef} sendCmd={sendCmd} pplIds={pplIds} pamIds={pamIds} />
-      {/* Tunnel scrolls continuously — stays frameloop="always", so this
-          just guards DPR under sustained load rather than idle-render cost. */}
+      {/* thorax — capsule instead of a squashed sphere: rounded ends read
+          as a real body segment rather than a stretched ball */}
+      <mesh position={[0, 0.01, 0.05]} rotation={[Math.PI / 2, 0, 0]} scale={[0.13, 0.13, 0.17]}>
+        <capsuleGeometry args={[1, 1, 4, 12]} />
+        <meshStandardMaterial color="#24242a" metalness={0.75} roughness={0.28} />
+      </mesh>
+      {/* abdomen — long thin capsule, smoothly tapered-looking via the
+          segmentation rings below rather than a hard cone point */}
+      <mesh position={[0, -0.005, -0.27]} rotation={[Math.PI / 2, 0, 0]} scale={[0.082, 0.082, 0.3]}>
+        <capsuleGeometry args={[1, 1, 4, 12]} />
+        <meshStandardMaterial color="#2c2c33" metalness={0.75} roughness={0.28} />
+      </mesh>
+      {[0.14, 0.24, 0.34, 0.42].map((z, i) => (
+        <mesh key={z} position={[0, -0.005, -z]} rotation={[Math.PI / 2, 0, 0]} scale={[0.084 - i * 0.012, 0.084 - i * 0.012, 1]}>
+          <torusGeometry args={[1, 0.05, 6, 16]} />
+          <meshStandardMaterial color="#131316" metalness={0.7} roughness={0.35} />
+        </mesh>
+      ))}
+      {/* head — mostly hidden behind the eyes, as in a real fly */}
+      <mesh position={[0, 0.015, 0.22]} scale={[0.085, 0.085, 0.085]}>
+        <sphereGeometry args={[1, 12, 10]} />
+        <meshStandardMaterial color="#1c1c20" metalness={0.8} roughness={0.22} />
+      </mesh>
+      {/* compound eyes — large, glossy, overlapping the head for a
+          seamless dome rather than two balls stuck on the side */}
+      <mesh position={[-0.075, 0.02, 0.25]} scale={[0.095, 0.1, 0.11]}>
+        <sphereGeometry args={[1, 14, 12]} />
+        <meshStandardMaterial color="#8a1f38" metalness={0.5} roughness={0.14} />
+      </mesh>
+      <mesh position={[0.075, 0.02, 0.25]} scale={[0.095, 0.1, 0.11]}>
+        <sphereGeometry args={[1, 14, 12]} />
+        <meshStandardMaterial color="#8a1f38" metalness={0.5} roughness={0.14} />
+      </mesh>
+      {/* legs */}
+      {LEG_PAIRS.map(({ z, splay, rake }) => (
+        <group key={z}>
+          <mesh position={[-0.07, -0.06, z]} rotation={[rake, 0, Math.PI / 2 - splay]} scale={[0.008, 0.15, 0.008]}>
+            <cylinderGeometry args={[1, 1, 1, 5]} />
+            <meshStandardMaterial color={LEG_COLOR} metalness={0.6} roughness={0.4} />
+          </mesh>
+          <mesh position={[0.07, -0.06, z]} rotation={[rake, 0, -(Math.PI / 2 - splay)]} scale={[0.008, 0.15, 0.008]}>
+            <cylinderGeometry args={[1, 1, 1, 5]} />
+            <meshStandardMaterial color={LEG_COLOR} metalness={0.6} roughness={0.4} />
+          </mesh>
+        </group>
+      ))}
+      <mesh ref={leftWingRef} position={[-0.04, 0.11, 0.02]} rotation={[0, 0.25, 0.18]} geometry={wingGeo}>
+        <meshStandardMaterial color="#dfeeff" transparent opacity={0.5} metalness={0.15} roughness={0.25} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh ref={rightWingRef} position={[0.04, 0.11, 0.02]} rotation={[0, -0.25, -0.18]} scale={[-1, 1, 1]} geometry={wingGeo}>
+        <meshStandardMaterial color="#dfeeff" transparent opacity={0.5} metalness={0.15} roughness={0.25} side={THREE.DoubleSide} />
+      </mesh>
+    </>
+  )
+}
+
+// fly_rigged.glb (see build_fly_anatomical_mesh.py) is a genuine
+// multi-node hierarchy — one glTF node per real flygym joint (several
+// stack on a single MuJoCo body; e.g. Coxa gets yaw+pitch+roll before its
+// own frame is final), each exported at its correct rest transform. Every
+// node stays in flygym's own raw local axes — the one global MJ_TO_THREE
+// change of basis is baked into a single root node at export time, not
+// applied per-joint — so a joint's LIVE local rotation is just its raw
+// obs["joints"] angle on the axis jointAxisProp() gives it, no per-frame
+// basis conversion needed here. RenderErrorBoundary/Suspense above this
+// still catch a failed/missing asset and fall back to the procedural
+// model, same as before.
+function RiggedFlyModel({ url, physicsRef }) {
+  const { scene, nodes } = useGLTF(url)
+  useFrame(() => {
+    const joints = physicsRef.current.joints
+    if (!joints) return
+    for (let i = 0; i < ACTUATED_JOINT_NAMES.length; i++) {
+      const node = nodes[ACTUATED_JOINT_NAMES[i]]
+      if (node) node.rotation[jointAxisProp(ACTUATED_JOINT_NAMES[i])] = joints[i]
+    }
+  })
+  return <primitive object={scene} />
+}
+
+// Third-person: the fly is a normal scene object (not attached to the
+// camera) positioned/oriented every frame directly from flyPhysicsRef,
+// which Dashboard's WS handler writes the instant fly_pos/fly_quat arrive
+// (a sibling can't receive per-frame updates as JSX props without going
+// through state, so this is the same ref-bridge pattern as telemetryRef).
+// No lerp, no accumulation, no smoothing: this reads whatever the ref
+// currently holds and applies it as-is, every render frame — if the
+// backend hasn't produced a new pose since the last render, this just
+// re-applies the same (already-applied) values, a no-op in practice, NOT
+// an interpolation step.
+function FlyBodyAvatar({ flyPhysicsRef }) {
+  const outerRef = useRef()
+  const thrustRef = useRef(0)
+  const _qMj = useMemo(() => new THREE.Quaternion(), [])
+  const _qThree = useMemo(() => new THREE.Quaternion(), [])
+  const _posMj = useMemo(() => new THREE.Vector3(), [])
+
+  useFrame(() => {
+    const p = flyPhysicsRef.current
+    const outer = outerRef.current
+    if (!outer || !p.pos) return
+    // Absolute position/orientation, remapped from MuJoCo's Z-up/+X-forward
+    // basis into this scene's Y-up/-Z-forward one (see MJ_TO_THREE above)
+    // — a fixed linear transform, valid for absolute values, not just
+    // deltas, so no per-frame accumulation is needed at all now that the
+    // backend itself tracks absolute pose.
+    _posMj.set(p.pos[0], p.pos[1], p.pos[2]).applyQuaternion(MJ_TO_THREE)
+    outer.position.copy(_posMj)
+    // Conjugation qThree = MJ_TO_THREE * qMj * MJ_TO_THREE⁻¹, the correct
+    // way to re-express a ROTATION (not a vector) in the other basis.
+    //
+    // This was previously written as a single chained expression that
+    // reused _qThree as both the running accumulator AND the scratch space
+    // for the inverse:
+    //   _qThree.copy(MJ_TO_THREE).multiply(_qMj)
+    //          .multiply(_qThree.copy(MJ_TO_THREE).invert())
+    // JS evaluates the argument before the outer .multiply() runs, so
+    // `_qThree.copy(MJ_TO_THREE).invert()` clobbered the half-finished
+    // MJ_TO_THREE*qMj still sitting in _qThree. The line therefore
+    // collapsed to MJ_TO_THREE⁻¹ * MJ_TO_THREE⁻¹ — a CONSTANT that threw
+    // the live orientation away entirely, pinning the model at one fixed
+    // wrong attitude (the face-down "faceplant"). Verified by running both
+    // forms against real telemetry in the actual three.js lib: the old one
+    // returned (0.5,-0.5,-0.5,-0.5) for every input. MJ_TO_THREE_INV is
+    // now a separate precomputed constant so no aliasing is possible.
+    _qMj.set(p.quat[1], p.quat[2], p.quat[3], p.quat[0]) // wire format is [w,x,y,z]
+    _qThree.copy(MJ_TO_THREE).multiply(_qMj).multiply(MJ_TO_THREE_INV)
+    outer.quaternion.copy(_qThree)
+    // Forced rest (body-side fatigue, physics_worker.py) reads as the
+    // wings stopping, not the model vanishing or freezing mid-pose.
+    thrustRef.current = p.resting ? 0 : p.thrust
+  })
+
+  // No scale here: fly_rigged.glb (see build_fly_anatomical_mesh.py) is
+  // real flygym anatomy assembled in the SAME mm-scale units fly_pos/
+  // fly_quat already use, so it's correctly sized at 1:1 against the real
+  // world position data — an arbitrary multiplier here would just
+  // reintroduce the fudge-factor real geometry was supposed to remove.
+  // The procedural fallback (unitless, artistically sized) keeps its own
+  // 0.6 scale below so it's unaffected.
+  return (
+    <group ref={outerRef}>
+      <RenderErrorBoundary fallback={<group scale={[0.6, 0.6, 0.6]}><ProceduralFlyFallback thrustRef={thrustRef} /></group>}>
+        <Suspense fallback={null}>
+          <RiggedFlyModel url="/fly_rigged.glb" physicsRef={flyPhysicsRef} />
+        </Suspense>
+      </RenderErrorBoundary>
+    </group>
+  )
+}
+
+// The camera's own "virtual connection to the body": MuJoCo's arena has no
+// walls, and the CPG only ever walks forward (no turning), so the fly's
+// real position drifts without bound — a fixed camera/far-plane (or the
+// fog) would eventually leave it clipped out or fogged into invisibility,
+// which is exactly what "se desaparece la mosca" was. This keeps the
+// ORBIT TARGET AND the camera tethered to the fly's own position every
+// frame (translating both by the same per-frame delta), so the user's
+// orbit/zoom is preserved relative to the body instead of to the empty
+// point in space the fly started at.
+function ChaseCamera({ flyPhysicsRef, controlsRef }) {
+  const { camera } = useThree()
+  const _posMj = useMemo(() => new THREE.Vector3(), [])
+  const _lastPos = useRef(null)
+
+  useFrame(() => {
+    const p = flyPhysicsRef.current
+    const controls = controlsRef.current
+    if (!controls || !p.pos) return
+    _posMj.set(p.pos[0], p.pos[1], p.pos[2]).applyQuaternion(MJ_TO_THREE)
+    if (_lastPos.current === null) {
+      // First fix: snap the target onto the fly instead of panning there
+      // from the origin over several frames.
+      const offset = _posMj.clone()
+      camera.position.add(offset)
+      controls.target.copy(_posMj)
+      _lastPos.current = _posMj.clone()
+      return
+    }
+    const delta = _posMj.clone().sub(_lastPos.current)
+    if (delta.lengthSq() > 1e-10) {
+      camera.position.add(delta)
+      controls.target.add(delta)
+      _lastPos.current.copy(_posMj)
+    }
+  })
+  return null
+}
+
+function TunnelScene({ flyPhysicsRef, onDeclinePerf, onInclinePerf }) {
+  const controlsRef = useRef()
+  return (
+    <>
+      {/* Studio gray, not pure black — a lit MeshStandardMaterial fly
+          needs actual lights (below) to read as anything but a silhouette,
+          which pure-unlit MeshBasicMaterial never needed. */}
+      <color attach="background" args={['#111111']} />
+      <fog attach="fog" args={['#111111', 6, 18]} />
+      <ambientLight intensity={0.5} />
+      <directionalLight position={[3, 5, 2]} intensity={1.4} />
+      {/* HDRI reflections for the metallic fallback fly — this fetches
+          from a CDN, so it's wrapped in its own error boundary: if that
+          fetch fails (offline, blocked network), the scene still has the
+          two real lights above and just skips the reflections rather than
+          taking Module 1 down with it. */}
+      <RenderErrorBoundary fallback={null}>
+        <Suspense fallback={null}>
+          <Environment preset="city" />
+        </Suspense>
+      </RenderErrorBoundary>
+      <FlyBodyAvatar flyPhysicsRef={flyPhysicsRef} />
+      {/* Open laboratory floor — no walls, no obstacles; see the
+          module-level note above for what that costs the sensory/reward
+          hooks. A solid plane, not just the Grid's lines, so the fly reads
+          as standing on real ground (matching flygym's own default
+          FlatTerrain arena, which is what actually supports it physically
+          — this mesh is a visual match for that, not a second physics
+          floor). At y=0, not an arbitrary offset: MJ_TO_THREE maps
+          mj_z directly to three_y with no additive shift (see its own
+          comment), and flygym's FlatTerrain sits at mj_z=0 — so y=0 is
+          where the real ground genuinely is, not a tuned guess. Sits a
+          hair below the Grid to avoid z-fighting. */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.002, 0]} receiveShadow>
+        <planeGeometry args={[60, 60]} />
+        <meshStandardMaterial color="#1a1a1e" roughness={0.92} metalness={0.05} />
+      </mesh>
+      <Grid
+        args={[50, 50]}
+        cellColor="#333333" sectionColor="#555555" fadeDistance={30} infiniteGrid
+        position={[0, 0, 0]}
+      />
+      {/* Free camera, same as Module 2 — the user's own orbit/zoom is the
+          only thing that moves it relative to the body; ChaseCamera below
+          keeps that same relative offset attached to the fly instead of to
+          the empty point in space it started at (see its own comment). */}
+      <OrbitControls ref={controlsRef} makeDefault enableDamping dampingFactor={0.08} rotateSpeed={0.5} />
+      <ChaseCamera flyPhysicsRef={flyPhysicsRef} controlsRef={controlsRef} />
       <PerformanceMonitor onDecline={onDeclinePerf} onIncline={onInclinePerf} />
+      <RenderErrorBoundary fallback={null}>
+        <EffectComposer>
+          <Bloom height={300} luminanceThreshold={0.6} luminanceSmoothing={0.9} intensity={1.4} mipmapBlur />
+        </EffectComposer>
+      </RenderErrorBoundary>
     </>
   )
 }
@@ -501,10 +884,13 @@ function SensoryMatrix({ telemetryRef }) {
       ctx.fillStyle = '#050505'
       ctx.fillRect(0, 0, w, h)
 
-      const { proxLeft = 0, proxRight = 0 } = telemetryRef.current
+      // Real per-eye retina downsample straight off the WebSocket (see
+      // vision_grid in telemetry_server.py); index 0 = left eye, 1 =
+      // right, matching obs["vision"]'s eye-major layout.
+      const grid = telemetryRef.current.visionGrid
       const eyeW = w / 2
-      drawEye(ctx, 0, 0, eyeW, h, proxLeft, '#4fd0ff')
-      drawEye(ctx, eyeW, 0, eyeW, h, proxRight, '#22e07a')
+      drawEye(ctx, 0, 0, eyeW, h, grid ? grid[0] : null, '#4fd0ff')
+      drawEye(ctx, eyeW, 0, eyeW, h, grid ? grid[1] : null, '#22e07a')
 
       ctx.strokeStyle = '#1a1a1a'
       ctx.beginPath(); ctx.moveTo(eyeW, 0); ctx.lineTo(eyeW, h); ctx.stroke()
@@ -520,7 +906,12 @@ function SensoryMatrix({ telemetryRef }) {
   )
 }
 
-function drawEye(ctx, ox, oy, w, h, proximity, colorHex) {
+// `cells` is one eye's real 9x9 luminance downsample (81 floats, 0..1),
+// binned server-side by each ommatidium's true position on the actual
+// MuJoCo retina render — see physics_worker.py. Null until the physics
+// process has produced its first vision frame, which draws as a dim
+// uniform grid rather than a fabricated pattern.
+function drawEye(ctx, ox, oy, w, h, cells, colorHex) {
   const pad = Math.min(w, h) * 0.08
   const cellW = (w - pad * 2) / OMMATIDIA_COLS
   const cellH = (h - pad * 2) / OMMATIDIA_ROWS
@@ -529,11 +920,12 @@ function drawEye(ctx, ox, oy, w, h, proximity, colorHex) {
     for (let col = 0; col < OMMATIDIA_COLS; col++) {
       const cx = ox + pad + cellW * (col + 0.5)
       const cy = oy + pad + cellH * (row + 0.5)
-      // radial falloff so activation reads as "looking at a near wall"
-      const dx = (col - (OMMATIDIA_COLS - 1) / 2) / OMMATIDIA_COLS
-      const dy = (row - (OMMATIDIA_ROWS - 1) / 2) / OMMATIDIA_ROWS
-      const falloff = 1 - Math.min(1, Math.hypot(dx, dy) * 1.4)
-      const activation = Math.max(0.06, proximity * falloff)
+      const lum = cells ? cells[row * OMMATIDIA_COLS + col] : 0
+      // sqrt so the dim end of the real luminance range stays legible on
+      // screen; small floor so an unlit ommatidium is still visibly a
+      // sensor rather than blank canvas. No synthetic falloff//gradient —
+      // whatever spatial structure shows up here is really in the render.
+      const activation = Math.min(1, 0.12 + Math.sqrt(Math.max(0, lum)) * 0.88)
       ctx.beginPath()
       ctx.arc(cx, cy, r, 0, Math.PI * 2)
       ctx.fillStyle = colorHex
@@ -555,8 +947,16 @@ function drawEye(ctx, ox, oy, w, h, proximity, colorHex) {
 const RASTER_ROW_SPECS = [
   { label: 'DN·L', color: '#ff6644', match: (n) => n.is_dn && n.soma_side === 'L', n: 14 },
   { label: 'DN·R', color: '#ff6644', match: (n) => n.is_dn && n.soma_side === 'R', n: 14 },
-  { label: 'optic·L', color: '#4fd0ff', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'L', n: 10 },
-  { label: 'optic·R', color: '#4fd0ff', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'R', n: 10 },
+  // Eye side from `instance`, not soma_side — these two rows were
+  // sampling from just 23 L / 13 R annotated neurons instead of the real
+  // 2,349 / 3,749 (see the SENSORY_CHANNELS note).
+  { label: 'optic·L', color: '#4fd0ff', match: (n) => n.superclass === 'ol_sensory' && (n.instance || '').endsWith('_L'), n: 10 },
+  { label: 'optic·R', color: '#4fd0ff', match: (n) => n.superclass === 'ol_sensory' && (n.instance || '').endsWith('_R'), n: 10 },
+  // The two exogenously-stimulated afferent populations get their own
+  // rows so injected current is directly observable as localized firing
+  // in the stimulated neuropil, rather than only inferable downstream.
+  { label: 'ORN', color: '#22e07a', match: (n) => (n.type || '').startsWith('ORN'), n: 10 },
+  { label: 'JO', color: '#22c2e0', match: (n) => (n.type || '').startsWith('JO'), n: 8 },
   { label: 'KC', color: '#7a5fd6', match: (n) => n.class === 'Kenyon_Cell', n: 10 },
   { label: 'MBON', color: '#d65fb0', match: (n) => n.class === 'MBON', n: 10 },
   { label: 'PAM', color: '#ffcc33', match: (n) => n.class === 'DAN' && (n.type || '').startsWith('PAM'), n: 6 },
@@ -657,9 +1057,26 @@ const RLMetrics = forwardRef(function RLMetrics(_props, ref) {
       const { width: w, height: h } = canvas
       ctx.fillStyle = '#050505'
       ctx.fillRect(0, 0, w, h)
-      const halfH = h / 2
-      drawSeries(ctx, bufRef.current.dopamine, 0, halfH - 10, w, '#ffcc33', true, 'MBON dopamine release')
-      drawSeries(ctx, bufRef.current.cumulative, halfH + 10, halfH - 10, w, '#4fa3ff', false, 'cumulative reward')
+
+      // Learning maturity: fraction of recent cumulative_reward deltas
+      // that were non-negative — "stabilizing" read as "mostly not
+      // dropping lately," directly off the same buffer already kept for
+      // the chart below, not a separate tracked quantity.
+      const barH = 16
+      const maturity = computeMaturity(bufRef.current.cumulative)
+      ctx.fillStyle = '#161616'
+      ctx.fillRect(0, 0, w, barH)
+      ctx.fillStyle = '#22e07a'
+      ctx.fillRect(0, 0, w * (maturity / 100), barH)
+      ctx.fillStyle = '#e0e0e0'
+      ctx.font = '10px monospace'
+      ctx.fillText(`learning maturity: ${maturity}%`, 8, barH - 5)
+
+      const chartTop = barH
+      const chartH = h - barH
+      const halfH = chartTop + chartH / 2
+      drawSeries(ctx, bufRef.current.dopamine, chartTop, chartH / 2 - 10, w, '#ffcc33', true, 'MBON dopamine release')
+      drawSeries(ctx, bufRef.current.cumulative, halfH + 10, chartH / 2 - 10, w, '#4fa3ff', false, 'cumulative reward')
       ctx.strokeStyle = '#1a1a1a'
       ctx.beginPath(); ctx.moveTo(0, halfH); ctx.lineTo(w, halfH); ctx.stroke()
     }
@@ -686,6 +1103,16 @@ const RLMetrics = forwardRef(function RLMetrics(_props, ref) {
   )
 })
 
+function computeMaturity(cumulative) {
+  const k = Math.min(60, cumulative.length - 1)
+  if (k < 5) return 0
+  let nonNeg = 0
+  for (let i = cumulative.length - k; i < cumulative.length; i++) {
+    if (cumulative[i] - cumulative[i - 1] >= 0) nonNeg++
+  }
+  return Math.round((nonNeg / k) * 100)
+}
+
 function drawSeries(ctx, data, top, height, width, colorHex, zeroCentered, label) {
   ctx.fillStyle = '#7a8494'
   ctx.font = '11px monospace'
@@ -711,21 +1138,240 @@ function drawSeries(ctx, data, top, height, width, colorHex, zeroCentered, label
 }
 
 // ---------------------------------------------------------------------
+// Drag-resizable module grid. Pane sizes live in a ref (pixel values on
+// the root's own CSS custom properties), never React state — a resize
+// drag fires pointermove far faster than 60Hz, and every module holds a
+// live WebGL canvas or its own rAF loop, so re-rendering Dashboard on
+// every pixel of drag would be the same 60Hz-into-React mistake this file
+// has spent this whole build avoiding elsewhere, just from mouse input
+// instead of the WebSocket.
+// ---------------------------------------------------------------------
+
+const PANE_MIN = 140 // px — a pane can't be dragged smaller than this
+
+function useResizableGrid() {
+  // The actual DOM node — kept in a plain ref because a *callback* ref
+  // (rootRef, returned below) is what's attached in JSX. That distinction
+  // is the actual fix here: Dashboard renders a "Loading..." placeholder
+  // (no .dashboard-root at all) until the graph fetch resolves, so a
+  // useEffect/useLayoutEffect tied to mount timing ran ONCE, on that first
+  // loading-placeholder commit, found rootRef.current still null, and
+  // silently no-op'd — leaving every size permanently null. The grid then
+  // rendered off CSS percentage fallbacks forever, and the first actual
+  // drag computed `null + dx` (JS coerces null -> 0), writing one pane's
+  // CSS var to a real pixel value while the other three stayed on
+  // mismatched percentage fallbacks — a broken mix of units in the same
+  // grid-template-columns, which is exactly the "looks awful after
+  // touching one pane" symptom. A callback ref fires exactly when the
+  // real node appears, whichever render that happens to be.
+  const elRef = useRef(null)
+  const sizesRef = useRef({ rowH: null, colTop: null, colBotA: null, colBotB: null })
+  const lastRectRef = useRef({ w: 0, h: 0 })
+  const roRef = useRef(null)
+
+  const applyVars = useCallback(() => {
+    const root = elRef.current
+    const s = sizesRef.current
+    if (!root || s.rowH == null) return
+    root.style.setProperty('--row-h', `${s.rowH}px`)
+    root.style.setProperty('--col-top', `${s.colTop}px`)
+    root.style.setProperty('--col-bot-a', `${s.colBotA}px`)
+    root.style.setProperty('--col-bot-b', `${s.colBotB}px`)
+  }, [])
+
+  const rootRef = useCallback((node) => {
+    if (roRef.current) { roRef.current.disconnect(); roRef.current = null }
+    elRef.current = node
+    if (!node) return
+    // .dashboard-root is position:fixed;inset:0, so this only fires on an
+    // actual viewport resize — never as a side effect of applyVars()
+    // changing a child's grid-template-columns. On that first firing it
+    // seeds the initial 58/50/33/33 split from real measurements; on any
+    // later firing (the window was actually resized) it rescales the
+    // CURRENT ratios proportionally instead of leaving stale absolute
+    // pixel values behind, which is what "dynamic" resizing needs.
+    const ro = new ResizeObserver((entries) => {
+      const { width: w, height: h } = entries[0].contentRect
+      if (w <= 0 || h <= 0) return
+      const s = sizesRef.current
+      const prev = lastRectRef.current
+      if (s.rowH == null) {
+        s.rowH = h * 0.58; s.colTop = w * 0.5; s.colBotA = w / 3; s.colBotB = w / 3
+      } else if (prev.w > 0 && prev.h > 0 && (prev.w !== w || prev.h !== h)) {
+        const sx = w / prev.w, sy = h / prev.h
+        s.rowH *= sy; s.colTop *= sx; s.colBotA *= sx; s.colBotB *= sx
+      }
+      lastRectRef.current = { w, h }
+      applyVars()
+    })
+    ro.observe(node)
+    roRef.current = ro
+  }, [applyVars])
+
+  const dragRow = useCallback((dy) => {
+    const root = elRef.current
+    const s = sizesRef.current
+    if (!root || s.rowH == null) return
+    const max = root.clientHeight - PANE_MIN
+    s.rowH = Math.min(max, Math.max(PANE_MIN, s.rowH + dy))
+    applyVars()
+  }, [applyVars])
+
+  const dragColTop = useCallback((dx) => {
+    const root = elRef.current
+    const s = sizesRef.current
+    if (!root || s.colTop == null) return
+    const max = root.clientWidth - PANE_MIN
+    s.colTop = Math.min(max, Math.max(PANE_MIN, s.colTop + dx))
+    applyVars()
+  }, [applyVars])
+
+  const dragColBotA = useCallback((dx) => {
+    const root = elRef.current
+    const s = sizesRef.current
+    if (!root || s.colBotA == null) return
+    const max = root.clientWidth - s.colBotB - PANE_MIN * 2
+    s.colBotA = Math.min(max, Math.max(PANE_MIN, s.colBotA + dx))
+    applyVars()
+  }, [applyVars])
+
+  const dragColBotB = useCallback((dx) => {
+    const root = elRef.current
+    const s = sizesRef.current
+    if (!root || s.colBotB == null) return
+    const max = root.clientWidth - s.colBotA - PANE_MIN * 2
+    s.colBotB = Math.min(max, Math.max(PANE_MIN, s.colBotB + dx))
+    applyVars()
+  }, [applyVars])
+
+  return { rootRef, dragRow, dragColTop, dragColBotA, dragColBotB }
+}
+
+function Splitter({ orientation, onDrag }) {
+  const draggingRef = useRef(false)
+  return (
+    <div
+      className={`splitter splitter-${orientation}`}
+      onPointerDown={(e) => { draggingRef.current = true; e.currentTarget.setPointerCapture(e.pointerId) }}
+      onPointerMove={(e) => {
+        if (!draggingRef.current) return
+        onDrag(orientation === 'vertical' ? e.movementX : e.movementY)
+      }}
+      onPointerUp={(e) => { draggingRef.current = false; e.currentTarget.releasePointerCapture(e.pointerId) }}
+    />
+  )
+}
+
+// ---------------------------------------------------------------------
+// Every floating overlay panel (brain controls, sensory manipulation, the
+// module-2 stats/toggle panel, region info) goes through this so they can
+// all be collapsed to just their header and reopened — a rare per-panel
+// UI click, so plain useState is fine, no 60Hz concern here.
+// ---------------------------------------------------------------------
+
+function CollapsiblePanel({ title, className = '', defaultOpen = true, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className={`panel floating${className ? ' ' + className : ''}${open ? '' : ' collapsed'}`}>
+      <div className="panel-header" onClick={() => setOpen((o) => !o)}>
+        <span className="title">{title}</span>
+        <span className="collapse-caret">{open ? '▾' : '▸'}</span>
+      </div>
+      {open && <div className="panel-body">{children}</div>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------
 // Sensory manipulation panel (manual override) — real neuPrint populations,
 // unchanged from the sandbox build.
 // ---------------------------------------------------------------------
 
+// Valence-specific, LATERALIZED stimulus channels. Each targets a real
+// named population in male-cns:v1.0 (see the matching block in
+// run_simulation.py for the biology, including why VA1v is excluded from
+// "food" — it is the Or47b pheromone glomerulus, not a food-odor one).
+// Each channel sends TWO group drives (<key>_L / <key>_R) so asymmetric
+// stimulation can produce a genuine left/right motor difference.
+const FOOD_GLOM = new Set(['ORN_DM1', 'ORN_DM2', 'ORN_DM4', 'ORN_VA2', 'ORN_VM2'])
+const AVERSE_GLOM = new Set(['ORN_V', 'ORN_DA2', 'ORN_DL5'])
+const VALENCE_CHANNELS = [
+  { key: 'food', label: 'Food odor · attractant', sub: 'ORN → DM1/DM2/DM4/VA2/VM2',
+    color: '#22e07a', match: (n) => FOOD_GLOM.has(n.type) },
+  { key: 'co2', label: 'CO₂ / danger · aversive', sub: 'ORN → V (Gr21a) /DA2/DL5',
+    color: '#ff6644', match: (n) => AVERSE_GLOM.has(n.type) },
+  { key: 'wind', label: 'Wind · freeze reflex', sub: 'JO-C/D/E → AMMC',
+    color: '#22c2e0', match: (n) => /^JO-[CDE]/.test(n.type || '') },
+]
+
 const SENSORY_CHANNELS = [
-  { key: 'optic_L', label: 'Optic lobe · L', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'L' },
-  { key: 'optic_R', label: 'Optic lobe · R', match: (n) => n.superclass === 'ol_sensory' && n.soma_side === 'R' },
+  // Eye side comes from `instance` ("R1-R6_L"), not soma_side — soma_side
+  // is null for 6,062 of the 6,098 photoreceptors in this dataset, so
+  // matching on it showed 23/13 neurons instead of the real 2,349/3,749.
+  // Mirrors the same fix in run_simulation.py's BrainLIF.
+  { key: 'optic_L', label: 'Optic lobe · L', match: (n) => n.superclass === 'ol_sensory' && (n.instance || '').endsWith('_L') },
+  { key: 'optic_R', label: 'Optic lobe · R', match: (n) => n.superclass === 'ol_sensory' && (n.instance || '').endsWith('_R') },
   { key: 'antennal', label: "Antennal (Johnston's Organ)", match: (n) => (n.type || '').startsWith('JO') },
-  { key: 'olfactory', label: 'Olfactory (ORN)', match: (n) => n.type === 'ORN' },
+  // Real ORNs are typed by the antennal-lobe glomerulus they project to
+  // ("ORN_DA1", "ORN_VA1d", ...) — there is no neuron typed bare "ORN" in
+  // male-cns:v1.0, so the old exact-match selected ZERO neurons and this
+  // slider was a silent no-op (the "(0)" count in the UI).
+  { key: 'olfactory', label: 'Olfactory (ORN → Antennal Lobe)', match: (n) => (n.type || '').startsWith('ORN') },
   { key: 'leg_body', label: 'Leg / body mechanoreceptors', match: (n) => n.superclass === 'vnc_sensory' },
 ]
+
+// Intensity + pan -> per-side drive. balance -1 = fully left, 0 = both
+// sides equal, +1 = fully right; the favoured side keeps full intensity
+// rather than both being scaled down, so panning steers without also
+// quieting the stimulus.
+function panToSides(intensity, balance) {
+  return [
+    intensity * (balance <= 0 ? 1 : 1 - balance),
+    intensity * (balance >= 0 ? 1 : 1 + balance),
+  ]
+}
+
+function ValenceChannel({ ch, ids, sendCmd }) {
+  const [intensity, setIntensity] = useState(0)
+  const [balance, setBalance] = useState(0)
+
+  const push = (i, b) => {
+    const [l, r] = panToSides(i, b)
+    sendCmd({ cmd: 'set_group_drive', group: `${ch.key}_L`, rate: l })
+    sendCmd({ cmd: 'set_group_drive', group: `${ch.key}_R`, rate: r })
+  }
+  const [dl, dr] = panToSides(intensity, balance)
+
+  return (
+    <div className="control-row" style={{ borderLeft: `2px solid ${ch.color}`, paddingLeft: 8, marginBottom: 10 }}>
+      <div style={{ color: ch.color }}>{ch.label} <span style={{ opacity: 0.6 }}>({ids.length})</span></div>
+      <div style={{ opacity: 0.5, fontSize: '0.85em', marginBottom: 4 }}>{ch.sub}</div>
+      <label className="slider-label">
+        intensity: {intensity.toFixed(2)}
+        <input type="range" min="0" max="3" step="0.05" value={intensity}
+          onChange={(e) => { const v = parseFloat(e.target.value); setIntensity(v); push(v, balance) }} />
+      </label>
+      <label className="slider-label">
+        L/R balance: {balance === 0 ? 'center' : (balance < 0 ? `L +${(-balance).toFixed(2)}` : `R +${balance.toFixed(2)}`)}
+        <input type="range" min="-1" max="1" step="0.05" value={balance}
+          onChange={(e) => { const v = parseFloat(e.target.value); setBalance(v); push(intensity, v) }} />
+      </label>
+      <div style={{ opacity: 0.55, fontSize: '0.85em' }}>
+        drive · L {dl.toFixed(2)} · R {dr.toFixed(2)}
+      </div>
+    </div>
+  )
+}
 
 function SensoryPanel({ graph, sendCmd, groupDrive }) {
   const [local, setLocal] = useState({})
   useEffect(() => { if (groupDrive) setLocal(groupDrive) }, [groupDrive])
+
+  const valenceIds = useMemo(() => {
+    const out = {}
+    for (const ch of VALENCE_CHANNELS) out[ch.key] = graph.nodes.filter(ch.match).map((n) => n.id)
+    return out
+  }, [graph])
 
   const idsByChannel = useMemo(() => {
     const out = {}
@@ -734,8 +1380,22 @@ function SensoryPanel({ graph, sendCmd, groupDrive }) {
   }, [graph])
 
   return (
-    <div className="panel floating sensory-panel">
-      <div className="title">sensory manipulation</div>
+    <CollapsiblePanel title="sensory injection" className="sensory-panel">
+      <div style={{ opacity: 0.7, marginBottom: 6 }}>valence stimuli · lateralized</div>
+      {/* The L/R balance controls are a DIFFUSION PROBE, not a steering
+          control. Measured directly (lateralization_test.py, quiet network,
+          n=5 mirror cycles): unilateral odour produces a bilaterally
+          symmetric motor response — MN·L and MN·R differ by only ~4% — and
+          the steering statistic is null (t(4)=0.085, sign inconsistent).
+          Panning left/right changes WHERE current enters the 3D network,
+          which is visible in Module 2, but does not turn the body. */}
+      <div style={{ opacity: 0.5, fontSize: '0.85em', marginBottom: 8 }}>
+        probes stimulus diffusion through the network · does not steer the body
+      </div>
+      {VALENCE_CHANNELS.map((ch) => (
+        <ValenceChannel key={ch.key} ch={ch} ids={valenceIds[ch.key]} sendCmd={sendCmd} />
+      ))}
+      <div style={{ opacity: 0.7, margin: '10px 0 6px' }}>raw populations</div>
       {SENSORY_CHANNELS.map((ch) => {
         const ids = idsByChannel[ch.key]
         const rate = local[ch.key] ?? 0
@@ -764,11 +1424,11 @@ function SensoryPanel({ graph, sendCmd, groupDrive }) {
           </div>
         )
       })}
-    </div>
+    </CollapsiblePanel>
   )
 }
 
-function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connected, learningEnabled }) {
+function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connected, learningEnabled, danClamp }) {
   const [localDrive, setLocalDrive] = useState(1.0)
   const [localNoise, setLocalNoise] = useState(0.0)
 
@@ -782,8 +1442,7 @@ function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connecte
   const pamIds = useMemo(() => graph.nodes.filter((n) => n.class === 'DAN' && (n.type || '').startsWith('PAM')).map((n) => n.id), [graph])
 
   return (
-    <div className="panel floating control-panel">
-      <div className="title">brain controls</div>
+    <CollapsiblePanel title="network excitation" className="control-panel">
       <div className="control-row">
         <button className={connected ? 'btn ok' : 'btn bad'} disabled>
           {connected ? '● connected' : '○ disconnected'}
@@ -793,20 +1452,20 @@ function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connecte
         <button className="btn primary" onClick={() => sendCmd({ cmd: paused ? 'resume' : 'pause' })}>
           {paused ? '▶ resume' : '⏸ pause'}
         </button>
-        <button className="btn" onClick={() => sendCmd({ cmd: 'reset' })}>⟲ reset flight</button>
+        <button className="btn" onClick={() => sendCmd({ cmd: 'reset' })}>⟲ reset state</button>
       </div>
       <label className="slider-label">
-        sensory drive: {localDrive.toFixed(2)}
+        sensory injection: {localDrive.toFixed(2)}
         <input type="range" min="0" max="3" step="0.05" value={localDrive}
           onChange={(e) => { const v = parseFloat(e.target.value); setLocalDrive(v); sendCmd({ cmd: 'set_params', sensory_drive: v }) }} />
       </label>
       <label className="slider-label">
-        noise σ: {localNoise.toFixed(2)}
+        background excitation σ: {localNoise.toFixed(2)}
         <input type="range" min="0" max="1.5" step="0.02" value={localNoise}
           onChange={(e) => { const v = parseFloat(e.target.value); setLocalNoise(v); sendCmd({ cmd: 'set_params', noise_std: v }) }} />
       </label>
       <div className="control-row buttons">
-        <button className="btn" onClick={() => sendCmd({ cmd: 'inject_spike', body_ids: samplePlain(sensoryIds, 80) })}>stimulate sensory</button>
+        <button className="btn" onClick={() => sendCmd({ cmd: 'inject_spike', body_ids: samplePlain(sensoryIds, 80) })}>inject sensory volley</button>
       </div>
       <div className="control-row buttons">
         <button className="btn dn-left" onClick={() => sendCmd({ cmd: 'inject_spike', body_ids: samplePlain(dnLeftIds, 40) })}>fire DN · L</button>
@@ -829,7 +1488,31 @@ function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connecte
           fire PAM (appetitive)
         </button>
       </div>
-    </div>
+      {/* Explicitly-labelled SYNTHETIC override. Measured in this project:
+          PAM->PPL is 192 synapses and PPL->PAM is 453, and all 645 are
+          EXCITATORY — there is no mutual inhibition in male-cns:v1.0 to
+          "restore". Stimulating PAM alone raises PPL almost equally
+          (D_PAM/D_PPL = 1.09), so unclamped learning is generalised, not
+          associative. This toggle forces winner-take-all between the two
+          populations so isolated three-factor STDP can be observed. It is
+          off by default and must stay visibly marked as synthetic. */}
+      <div className="control-row buttons" style={{ marginTop: 8 }}>
+        <button
+          className={danClamp ? 'btn bad' : 'btn'}
+          onClick={() => sendCmd({ cmd: 'set_dan_clamp', enabled: !danClamp })}
+        >
+          {danClamp ? '⚠ DAN isolation ON (synthetic)' : '○ experimental DAN isolation (synthetic clamp)'}
+        </button>
+      </div>
+      <div style={{ opacity: 0.55, fontSize: '0.85em', marginTop: 4 }}>
+        Overrides biological cross-talk: the valence you inject wins, and the opposing
+        compartment is forced to zero. Has <b>no structural correlate</b> in the male-cns
+        connectome — all 645 PAM↔PPL synapses are excitatory, and stimulating PAM alone
+        raises PPL almost equally (ratio 1.09). With this OFF, learning is real but
+        <b>generalised</b> (both compartments depress ~equally: −3.6% / −3.8%); with it ON
+        the depression becomes compartment-specific by construction, not by biology.
+      </div>
+    </CollapsiblePanel>
   )
 }
 
@@ -838,6 +1521,7 @@ function ControlPanel({ graph, sendCmd, paused, sensoryDrive, noiseStd, connecte
 // ---------------------------------------------------------------------
 
 export default function Dashboard() {
+  const { rootRef, dragRow, dragColTop, dragColBotA, dragColBotB } = useResizableGrid()
   const [graph, setGraph] = useState(null)
   const [error, setError] = useState(null)
   const [connected, setConnected] = useState(false)
@@ -845,7 +1529,7 @@ export default function Dashboard() {
   // unless the value actually changed (see ws.onmessage below).
   const [uiState, setUiState] = useState({
     paused: false, sensoryDrive: null, noiseStd: null,
-    learningEnabled: false, groupDrive: null, _groupDriveStr: null,
+    learningEnabled: false, danClamp: false, groupDrive: null, _groupDriveStr: null,
   })
   // DPR ceiling per canvas — starts at the 1.5 cap, PerformanceMonitor
   // (in BrainScene/TunnelScene) drops it to 1 under sustained frame drops
@@ -853,12 +1537,19 @@ export default function Dashboard() {
   // times a session at most), so plain useState is fine here.
   const [brainDpr, setBrainDpr] = useState(1.5)
   const [tunnelDpr, setTunnelDpr] = useState(1.5)
+  // 3D vs 2D-schematic for Module 2 — a user toggle, not a 60Hz value.
+  const [brainView, setBrainView] = useState('3d')
+  // Region pill selection (Whole Brain / Optic Lobes / Mushroom Body /
+  // DNs) — also a rare user action, not 60Hz data.
+  const [selectedRegion, setSelectedRegion] = useState('all')
 
   const spikeQueueRef = useRef(null)
   const wsRef = useRef(null)
-  const flightCmdRef = useRef({ thrust: 0.5, yaw_rate: 0 })
   const plasticWeightRef = useRef(null)
-  const telemetryRef = useRef({ proxLeft: 0, proxRight: 0, collided: false, collisionCount: 0 })
+  const telemetryRef = useRef({ proxLeft: 0, proxRight: 0 })
+  // Raw fly_pos/fly_quat from the WebSocket, applied directly by
+  // FlyBodyAvatar with no interpolation — see the note above MJ_TO_THREE.
+  const flyPhysicsRef = useRef({ pos: null, quat: null, thrust: 0, fatigue: 0, resting: false, joints: null })
   const rasterRef = useRef(null)
   const rlMetricsRef = useRef(null)
   // Module 2 runs frameloop="demand" (it's otherwise static — nothing to
@@ -874,6 +1565,13 @@ export default function Dashboard() {
   // React state (the CRITICAL RULE: no useState for 60Hz data).
   const hudRefs = useRef({})
   const setHud = useCallback((key) => (el) => { hudRefs.current[key] = el }, [])
+  // The WS handler below is set up once ([] deps — reconnecting the socket
+  // on every region click would be wrong) but needs the CURRENT selected
+  // region/its member ids every tick to compute the side panel's live
+  // count — mirrored into refs rather than added to the effect's deps
+  // (populated once `regionIds` exists, below).
+  const selectedRegionRef = useRef(selectedRegion)
+  const regionIdsRef = useRef(null)
 
   useEffect(() => {
     fetch(GRAPH_URL)
@@ -898,22 +1596,57 @@ export default function Dashboard() {
       ws.onmessage = (evt) => {
         const d = JSON.parse(evt.data)
         spikeQueueRef.current = d.spiking_ids
-        flightCmdRef.current = { thrust: d.thrust, yaw_rate: d.yaw_rate }
+        // Passive listener, no interpolation: FlyBodyAvatar applies
+        // whatever's here directly on its next useFrame — see MJ_TO_THREE.
+        if (d.fly_pos) {
+          flyPhysicsRef.current.pos = d.fly_pos
+          flyPhysicsRef.current.quat = d.fly_quat
+          flyPhysicsRef.current.thrust = d.thrust
+          flyPhysicsRef.current.fatigue = d.fly_fatigue ?? 0
+          flyPhysicsRef.current.resting = !!d.fly_resting
+          if (d.fly_joints) flyPhysicsRef.current.joints = d.fly_joints
+        }
+        if (d.vision_grid) telemetryRef.current.visionGrid = d.vision_grid
         if (d.plastic_weight_changes) plasticWeightRef.current = d.plastic_weight_changes
 
         const h = hudRefs.current
         if (h.t) h.t.textContent = d.t.toFixed(3)
-        if (h.thrust) h.thrust.textContent = d.thrust.toFixed(2)
-        if (h.yaw) h.yaw.textContent = d.yaw_rate.toFixed(2)
-        if (h.dnLeft) h.dnLeft.textContent = (d.dn_left_rate ?? 0).toFixed(1)
-        if (h.dnRight) h.dnRight.textContent = (d.dn_right_rate ?? 0).toFixed(1)
+        // thrust/yaw_rate are still broadcast (legacy flight_command
+        // readout) but are no longer rendered — see the note in Module 1's
+        // HUD. Nothing in the physics path consumes them.
+        // mn_activation_left/right is the actual efferent signal reaching
+        // physics_worker.py's CPG (see set_forward_drive) — dn_left/right
+        // Hz above (raster/ControlPanel) is a separate, real readout of
+        // the DN circuit itself, just no longer what drives the body.
+        if (h.mnLeft) h.mnLeft.textContent = (d.mn_activation_left ?? 0).toFixed(3)
+        if (h.mnRight) h.mnRight.textContent = (d.mn_activation_right ?? 0).toFixed(3)
+        // The efferent cascade, in order: premotor DNs (the bottleneck the
+        // signal must cross to leave the brain) -> named locomotor DNs ->
+        // MN activation above -> CPG drive in the physics process.
+        if (h.dnPre) h.dnPre.textContent = (d.dn_premotor_rate ?? 0).toFixed(1)
+        if (h.dnNamed && d.dn_named_rates) {
+          const r = d.dn_named_rates
+          h.dnNamed.textContent = `b01 ${(r.DNb01 ?? 0).toFixed(1)} · b02 ${(r.DNb02 ?? 0).toFixed(1)} · p09 ${(r.DNp09 ?? 0).toFixed(1)}`
+        }
         if (h.spiking) h.spiking.textContent = d.spiking_ids.length
-        if (h.collisions) h.collisions.textContent = telemetryRef.current.collisionCount
+        if (h.physics) h.physics.textContent = d.fly_pos ? 'live' : 'initializing…'
+        if (h.fatigue) h.fatigue.textContent = (d.fly_fatigue ?? 0).toFixed(2)
+        if (h.resting) h.resting.textContent = d.fly_resting ? 'RESTING' : 'active'
         if (h.reward) h.reward.textContent = (d.reward_signal ?? 0).toFixed(3)
         if (h.cumulative) h.cumulative.textContent = (d.cumulative_reward ?? 0).toFixed(2)
 
+        // Module 2 side panel: live spike count for whichever region pill
+        // is currently selected (or total spiking if 'all').
+        if (h.regionCount) {
+          const idsSet = regionIdsRef.current ? regionIdsRef.current[selectedRegionRef.current] : null
+          h.regionCount.textContent = idsSet ? d.spiking_ids.filter((id) => idsSet.has(id)).length : d.spiking_ids.length
+        }
+
         if (rasterRef.current) rasterRef.current.pushTick(d.spiking_ids)
         if (rlMetricsRef.current) rlMetricsRef.current.pushSample(d.reward_signal ?? 0, d.cumulative_reward ?? 0)
+        // Brain2DMap (Module 2's 2D mode) reads spikeQueueRef/plasticWeightRef
+        // directly in its own rAF loop — same refs BrainPointCloud (3D mode)
+        // already consumes, no separate pushTick wiring needed.
 
         // Module 2 is frameloop="demand" — nudge it to actually draw this
         // tick's spikes/plasticity now that the refs above are updated.
@@ -934,6 +1667,7 @@ export default function Dashboard() {
             (d.sensory_drive ?? null) === prev.sensoryDrive &&
             (d.noise_std ?? null) === prev.noiseStd &&
             !!d.learning_enabled === prev.learningEnabled &&
+            !!d.dan_clamp === prev.danClamp &&
             groupDriveStr === prev._groupDriveStr
           ) return prev
           return {
@@ -941,6 +1675,7 @@ export default function Dashboard() {
             sensoryDrive: d.sensory_drive ?? null,
             noiseStd: d.noise_std ?? null,
             learningEnabled: !!d.learning_enabled,
+            danClamp: !!d.dan_clamp,
             groupDrive: d.group_drive ?? null,
             _groupDriveStr: groupDriveStr,
           }
@@ -952,73 +1687,140 @@ export default function Dashboard() {
   }, [])
 
   const layout = useBrainLayout(graph ?? { nodes: [], edges: [] })
+  const regionIds = useBrainRegionIds(graph ?? { nodes: [] })
+  const regionIndexSets = useBrainRegionIndexSets(layout, regionIds)
+  useEffect(() => { selectedRegionRef.current = selectedRegion }, [selectedRegion])
+  useEffect(() => { regionIdsRef.current = regionIds }, [regionIds])
   const rasterRows = useRasterRows(graph ?? { nodes: [] })
-  const pplIds = useMemo(() => (graph ? graph.nodes.filter((n) => n.class === 'DAN' && (n.type || '').startsWith('PPL')).map((n) => n.id) : []), [graph])
-  const pamIds = useMemo(() => (graph ? graph.nodes.filter((n) => n.class === 'DAN' && (n.type || '').startsWith('PAM')).map((n) => n.id) : []), [graph])
 
   if (error) return <div className="panel error">{error}</div>
   if (!graph) return <div className="panel">Loading brain_graph.json...</div>
 
   return (
-    <div className="dashboard-root">
-      {/* MODULE 1 — Optic Flow Tunnel (closed-loop VR environment) */}
+    <div className="dashboard-root" ref={rootRef}>
+      <div className="row-top">
+      {/* MODULE 1 — passive observer of a live flygym/MuJoCo body sim
+          running in its own OS process (physics_worker.py). No
+          interpolation: fly_pos/fly_quat are applied straight to the mesh
+          the instant they arrive — see the note above MJ_TO_THREE. */}
       <div className="module module-1">
-        {/* Tunnel keeps frameloop="always" (default) — it's a continuous
-            scroll animation, nothing to gain from demand rendering here.
-            DPR is still capped to protect fill-rate on 4K/Retina panels. */}
-        <Canvas dpr={[1, tunnelDpr]} camera={{ fov: 70, position: [0, 0, 0], near: 0.05, far: 20 }}>
+        {/* Stays frameloop="always" (default) — continuous playback,
+            nothing to gain from demand rendering here. DPR is still capped
+            to protect fill-rate on 4K/Retina panels. */}
+        {/* Initial vantage only — OrbitControls (in TunnelScene) owns the
+            camera from here on, free to pan/zoom/rotate. */}
+        <Canvas dpr={[1, tunnelDpr]} camera={{ fov: 70, position: [0, 1.4, 5], near: 0.05, far: 30 }}>
           <TunnelScene
-            flightCmdRef={flightCmdRef} telemetryRef={telemetryRef} sendCmd={sendCmd} pplIds={pplIds} pamIds={pamIds}
+            flyPhysicsRef={flyPhysicsRef}
             onDeclinePerf={() => setTunnelDpr(1)} onInclinePerf={() => setTunnelDpr(1.5)}
           />
         </Canvas>
-        <div className="panel floating module-hud">
-          <div className="title">optic flow tunnel</div>
+        <CollapsiblePanel title="efferent monitoring" className="module-hud">
           <div>t = <span ref={setHud('t')}>0.000</span>s</div>
-          <div>thrust <span ref={setHud('thrust')}>0.00</span> · yaw <span ref={setHud('yaw')}>0.00</span></div>
-          <div>DN·L <span ref={setHud('dnLeft')}>0.0</span>Hz · DN·R <span ref={setHud('dnRight')}>0.0</span>Hz</div>
-          <div>spiking: <span ref={setHud('spiking')}>0</span> · collisions: <span ref={setHud('collisions')}>0</span></div>
-        </div>
+          {/* thrust/yaw deliberately NOT shown: flight_command()'s yaw_rate
+              is a legacy readout that drives nothing (see the symmetric
+              forward-drive lock in physics_worker.set_forward_drive).
+              Displaying a yaw number next to a model that cannot turn
+              implies a steering capability the measurements refuted. */}
+          <div>premotor DN <span ref={setHud('dnPre')}>0.0</span>Hz (981 cells → VNC)</div>
+          <div>DN <span ref={setHud('dnNamed')}>b01 0.0 · b02 0.0 · p09 0.0</span> Hz</div>
+          <div>MN·L <span ref={setHud('mnLeft')}>0.000</span> · MN·R <span ref={setHud('mnRight')}>0.000</span> (real efferent drive)</div>
+          <div>spiking: <span ref={setHud('spiking')}>0</span> · physics: <span ref={setHud('physics')}>initializing…</span></div>
+          <div>fatigue <span ref={setHud('fatigue')}>0.00</span> · <span ref={setHud('resting')}>active</span></div>
+        </CollapsiblePanel>
         <ControlPanel
           graph={graph} sendCmd={sendCmd} paused={uiState.paused}
           sensoryDrive={uiState.sensoryDrive} noiseStd={uiState.noiseStd} connected={connected}
-          learningEnabled={uiState.learningEnabled}
+          learningEnabled={uiState.learningEnabled} danClamp={uiState.danClamp}
         />
       </div>
 
+      <Splitter orientation="vertical" onDrag={dragColTop} />
+
       {/* MODULE 2 — 3D volumetric connectome morphology */}
       <div className="module module-2">
-        {/* frameloop="demand": this canvas is otherwise static between
-            spikes/plasticity updates and OrbitControls interaction, so
-            there's no reason to render it 60x/sec unconditionally — see
-            brainInvalidateRef wiring in the WS handler above. */}
-        <Canvas
-          dpr={[1, brainDpr]} frameloop="demand" camera={{ position: [0, 0, 6], fov: 50 }}
-          onCreated={(state) => { brainInvalidateRef.current = state.invalidate }}
-        >
-          <BrainScene
-            layout={layout} spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef}
-            onDeclinePerf={() => setBrainDpr(1)} onInclinePerf={() => setBrainDpr(1.5)}
-          />
-        </Canvas>
-        <div className="panel floating module-hud small">
-          <div className="title">male-cns:v1.0 — {graph.meta.node_count.toLocaleString()} neurons</div>
-          <div>DNs: {graph.meta.dn_count.toLocaleString()} · edges: {graph.meta.edge_count.toLocaleString()}</div>
+        {brainView === '3d' ? (
+          // frameloop="demand": this canvas is otherwise static between
+          // spikes/plasticity updates and OrbitControls interaction, so
+          // there's no reason to render it 60x/sec unconditionally — see
+          // brainInvalidateRef wiring in the WS handler above.
+          <Canvas
+            dpr={[1, brainDpr]} frameloop="demand" camera={{ position: [0, 0, 6], fov: 50 }}
+            onCreated={(state) => { brainInvalidateRef.current = state.invalidate }}
+          >
+            <BrainScene
+              layout={layout} regionIndexSets={regionIndexSets} selectedRegion={selectedRegion}
+              spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef}
+              onDeclinePerf={() => setBrainDpr(1)} onInclinePerf={() => setBrainDpr(1.5)}
+            />
+          </Canvas>
+        ) : (
+          // Cheap 2D alternative for lower-end GPUs — the REAL dataset
+          // (same layout/spikeQueueRef/plasticWeightRef as the 3D view
+          // above), just rasterized onto a flat canvas instead of
+          // instanced WebGL. Not mounted at all in '3d' mode and vice
+          // versa, so switching actually frees the GPU cost, not just
+          // hides it.
+          <Brain2DMap layout={layout} spikeQueueRef={spikeQueueRef} plasticWeightRef={plasticWeightRef} />
+        )}
+
+        {/* Top pills — real neuPrint populations, not decorative tabs.
+            Selecting one ghosts the rest of the point cloud and lights the
+            selection up in its neon color (3D mode only; harmless no-op
+            state in 2D mode). */}
+        <div className="region-pills">
+          {BRAIN_REGIONS.map((r) => (
+            <button
+              key={r.key}
+              className={`region-pill${selectedRegion === r.key ? ' active' : ''}`}
+              style={{ '--dot': r.dotColor }}
+              onClick={() => setSelectedRegion(r.key)}
+            >
+              <span className="dot" />{r.label}
+            </button>
+          ))}
         </div>
+
+        <CollapsiblePanel
+          title={<>male-cns:v1.0 — {graph.meta.node_count.toLocaleString()} neurons</>}
+          className="module-hud small"
+        >
+          <div>DNs: {graph.meta.dn_count.toLocaleString()} · edges: {graph.meta.edge_count.toLocaleString()}</div>
+          <div className="control-row buttons" style={{ marginTop: 6 }}>
+            <button className={brainView === '3d' ? 'btn ok' : 'btn'} onClick={() => setBrainView('3d')}>3D morphology</button>
+            <button className={brainView === '2d' ? 'btn ok' : 'btn'} onClick={() => setBrainView('2d')}>2D neural map</button>
+          </div>
+        </CollapsiblePanel>
+
+        {/* Side info panel — title + live spike count for whichever region
+            is selected, computed straight off the WS payload (see
+            h.regionCount in the WS handler above), not React state. */}
+        <CollapsiblePanel title={BRAIN_REGIONS.find((r) => r.key === selectedRegion).label} className="region-info">
+          <div>live spikes: <span ref={setHud('regionCount')}>0</span></div>
+        </CollapsiblePanel>
+
         <SensoryPanel graph={graph} sendCmd={sendCmd} groupDrive={uiState.groupDrive} />
       </div>
+      </div>
 
+      <Splitter orientation="horizontal" onDrag={dragRow} />
+
+      <div className="row-bottom">
       {/* MODULE 3 — Sensory Matrix Array (ommatidia) */}
       <div className="module module-3">
         <div className="module-label">sensory matrix — L / R ommatidia</div>
         <SensoryMatrix telemetryRef={telemetryRef} />
       </div>
 
+      <Splitter orientation="vertical" onDrag={dragColBotA} />
+
       {/* MODULE 4 — High-performance spike raster */}
       <div className="module module-4">
-        <div className="module-label">spike raster — DN · optic · KC · MBON · PAM/PPL</div>
+        <div className="module-label">spike raster — DN · optic · ORN · JO · KC · MBON · PAM/PPL</div>
         <RasterPlot ref={rasterRef} rasterRows={rasterRows} />
       </div>
+
+      <Splitter orientation="vertical" onDrag={dragColBotB} />
 
       {/* MODULE 5 — RL "brain money" metrics */}
       <div className="module module-5">
@@ -1027,6 +1829,7 @@ export default function Dashboard() {
           cumulative reward: <span ref={setHud('cumulative')}>0.00</span>
         </div>
         <RLMetrics ref={rlMetricsRef} />
+      </div>
       </div>
     </div>
   )

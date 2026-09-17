@@ -7,3 +7,15 @@ pyarrow==25.0.1
 python-dotenv==1.2.3
 fastapi==0.141.1
 uvicorn[standard]==0.53.0
+# Live body simulation: telemetry_server.py spawns physics_worker.py's
+# flygym/MuJoCo process in production now (not just biomechanics_env.py's
+# R&D sandbox) — see physics_worker.py's docstring for why this has to be
+# a separate OS process on macOS, not a thread.
+flygym==1.2.1
+mujoco==3.2.7
+# Asset-build tooling only (build_fly_anatomical_mesh.py) — not imported
+# by telemetry_server.py/run_simulation.py/physics_worker.py, just used
+# once to assemble flygym's own real per-segment meshes into
+# dashboard/public/fly.glb.
+trimesh==5.1.0
+fast-simplification==0.2.0
